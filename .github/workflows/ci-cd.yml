@@ -1,0 +1,73 @@
+name: RiderCMS CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      firebase_token: ${{ steps.get_token.outputs.firebase_token }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npm --prefix deposit-service install
+          npm --prefix collectionpay-service install
+          npm --prefix getsessionbymsisdn-service install
+          npm --prefix setusermsisdn-service install
+          npm --prefix collectionquote-service install
+          npm --prefix closesession-service install
+
+      - name: Authenticate Firebase
+        id: get_token
+        uses: w9jds/firebase-action@v3.3.0
+        with:
+          args: projects:list
+        env:
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+
+  deploy:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy Firebase Hosting
+        uses: w9jds/firebase-action@v3.3.0
+        with:
+          args: deploy --only hosting
+        env:
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+
+      - name: Deploy Cloud Run services
+        run: |
+          SERVICES=("deposit-service" "collectionpay-service" "getsessionbymsisdn-service" "setusermsisdn-service" "collectionquote-service" "closesession-service")
+          for SERVICE in "${SERVICES[@]}"; do
+            echo "Deploying $SERVICE to Cloud Run..."
+            gcloud run deploy $SERVICE \
+              --source ./$SERVICE \
+              --region africa-north1 \
+              --platform managed \
+              --allow-unauthenticated
+          done
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.GCP_SA_KEY }}
+ls .github/workflows
+
+
+ls .github/workflows
+
