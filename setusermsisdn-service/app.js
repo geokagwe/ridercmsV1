@@ -33,3 +33,4 @@ app.all("*", (req, res) => res.status(404).json({ error: "Not found" }));
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`setusermsisdn service listening on ${PORT}`));
+/* ci-redeploy: 1764491605 */
