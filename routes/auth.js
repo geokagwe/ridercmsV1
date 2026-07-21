@@ -482,8 +482,11 @@ router.post('/google/complete-profile', verifyFirebaseToken, async (req, res) =>
  *         description: Internal server error.
  */
 router.get('/profile', verifyFirebaseToken, async (req, res) => {
-  // The verifyFirebaseToken middleware has already validated the token
-  // and attached the user's decoded token to req.user.
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.removeHeader('ETag');
+
   const { uid } = req.user;
 
   const pool = await poolPromise;
@@ -586,6 +589,10 @@ router.get('/profile', verifyFirebaseToken, async (req, res) => {
  */
 router.post('/fcm-token', verifyFirebaseToken, async (req, res) => {
   const { uid } = req.user;
+
+  // Prevent conditional-GET caching on this per-user, always-dynamic endpoint
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.set('Pragma', 'no-cache');
   const { token } = req.body;
 
   if (token !== null && token !== undefined && typeof token !== 'string') {
