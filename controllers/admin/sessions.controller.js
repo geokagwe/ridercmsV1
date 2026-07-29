@@ -2,6 +2,7 @@ const { Router } = require('express');
 const logger = require('../../utils/logger.js');
 const poolPromise = require('../../db');
 const { verifyFirebaseToken, isAdmin } = require('../../middleware/auth');
+const { initiateSTKPush } = require('../../utils/mpesa');
 
 const router = Router();
 
@@ -241,6 +242,177 @@ router.delete('/sessions/:sessionId', [verifyFirebaseToken, isAdmin], async (req
 });
 
 /**
+ * POST /api/admin/sessions/:sessionId/charge
+ * @summary Trigger M-Pesa payment for a pending admin withdrawal session
+ * @description Initiates an M-Pesa STK push for a pending withdrawal session created by the
+ * admin manual-withdraw flow. Optionally allows the admin to override the amount and/or phone number.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: sessionId
+ *     required: true
+ *     schema:
+ *       type: integer
+ *     description: The ID of the pending withdrawal session.
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         required: [phone]
+ *         properties:
+ *           phone:
+ *             type: string
+ *             description: The phone number to send the STK push to.
+ *           amount:
+ *             type: number
+ *             description: Optional amount override. If omitted, uses the session's calculated amount.
+ * @responses
+ *   200:
+ *     description: STK push initiated.
+ *   404:
+ *     description: Pending session not found.
+ *   500:
+ *     description: Internal server error.
+ */
+router.post('/sessions/:sessionId/charge', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { sessionId } = req.params;
+  const { phone, amount: amountOverride } = req.body;
+
+  if (!phone) {
+    return res.status(400).json({ error: 'Phone number is required.' });
+  }
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Find the pending withdrawal session
+    const sessionRes = await client.query(
+      "SELECT id, amount, status FROM deposits WHERE id = $1 AND session_type = 'withdrawal' AND status IN ('pending', 'failed')",
+      [sessionId]
+    );
+
+    if (sessionRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'No pending or failed withdrawal session found.' });
+    }
+
+    const session = sessionRes.rows[0];
+    const finalAmount = amountOverride != null ? Number(amountOverride) : Number(session.amount);
+
+    if (finalAmount < 1) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Amount must be at least KES 1.' });
+    }
+
+    // 2. Update amount if overridden
+    if (amountOverride != null && Number(amountOverride) !== Number(session.amount)) {
+      await client.query('UPDATE deposits SET amount = $1 WHERE id = $2', [finalAmount, sessionId]);
+    }
+
+    // 3. Trigger M-Pesa STK Push
+    const mpesaResponse = await initiateSTKPush({
+      phone,
+      amount: finalAmount,
+      accountReference: `adm_${sessionId}`,
+      transactionDesc: `Admin withdraw ${sessionId}`,
+    });
+
+    const checkoutRequestId = mpesaResponse.data.CheckoutRequestID;
+
+    // 4. Store the checkout ID and mark as pending + started
+    await client.query(
+      "UPDATE deposits SET mpesa_checkout_id = $1, status = 'pending', started_at = NOW() WHERE id = $2",
+      [checkoutRequestId, sessionId]
+    );
+
+    await client.query('COMMIT');
+
+    logger.info(`Admin (UID: ${req.user.uid}) triggered M-Pesa charge for session ${sessionId}. CheckoutRequestID: ${checkoutRequestId}, amount KES ${finalAmount}.`);
+
+    res.status(200).json({
+      message: 'STK push sent. Waiting for payment confirmation.',
+      checkoutRequestId,
+      amount: finalAmount,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    if (error.isAxiosError) {
+      const errorDetails = { request: error.config, response: error.response?.data };
+      logger.error(`M-Pesa API error charging session ${sessionId}:`, errorDetails);
+    } else {
+      logger.error(`Failed to charge session ${sessionId}:`, error);
+    }
+    res.status(500).json({ error: 'Failed to trigger M-Pesa payment.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/admin/sessions/:sessionId/payment-status
+ * @summary Poll payment status for an admin-initiated withdrawal session
+ * @description Returns the current status of a withdrawal session so the admin frontend can
+ * poll after triggering payment via the /charge endpoint.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: sessionId
+ *     required: true
+ *     schema:
+ *       type: integer
+ *     description: The ID of the withdrawal session.
+ * @responses
+ *   200:
+ *     description: Payment status returned.
+ *   404:
+ *     description: Session not found.
+ *   500:
+ *     description: Internal server error.
+ */
+router.get('/sessions/:sessionId/payment-status', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { sessionId } = req.params;
+
+  const pool = await poolPromise;
+  try {
+    const result = await pool.query(
+      "SELECT status FROM deposits WHERE id = $1 AND session_type = 'withdrawal'",
+      [sessionId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Session not found.' });
+    }
+
+    const { status } = result.rows[0];
+
+    // Map internal statuses to a simpler payment status for the frontend
+    let paymentStatus;
+    if (status === 'completed') {
+      paymentStatus = 'paid';
+    } else if (status === 'in_progress') {
+      paymentStatus = 'paid';
+    } else if (status === 'failed') {
+      paymentStatus = 'failed';
+    } else {
+      paymentStatus = 'pending';
+    }
+
+    res.status(200).json({ paymentStatus, rawStatus: status });
+  } catch (error) {
+    logger.error(`Failed to get payment status for session ${sessionId}:`, error);
+    res.status(500).json({ error: 'Failed to retrieve payment status.', details: error.message });
+  }
+});
+
+/**
  * POST /api/admin/sessions/cleanup
  * @summary (System Task) Clean up old, stuck sessions.
  * @description Finds and resolves sessions that have been stuck in a transient state for too long (e.g., 'in_progress' for more than 5 minutes). This is intended to be called by a scheduled task (cron job).
@@ -256,6 +428,7 @@ router.delete('/sessions/:sessionId', [verifyFirebaseToken, isAdmin], async (req
 router.post('/sessions/cleanup', [verifyFirebaseToken, isAdmin], async (req, res) => {
   // This logic is designed to be idempotent.
   const STUCK_SESSION_TIMEOUT_MINUTES = 5;
+  const STALE_ADMIN_SESSION_TIMEOUT_MINUTES = 10;
   const pool = await poolPromise;
   const client = await pool.connect();
 
@@ -287,6 +460,21 @@ router.post('/sessions/cleanup', [verifyFirebaseToken, isAdmin], async (req, res
       }
     }
 
+    // --- Purge stale admin-created pending withdrawal sessions ---
+    // If the admin created a pending session but never triggered payment (or navigated away),
+    // clean it up so the slot is not blocked indefinitely.
+    const staleAdminRes = await client.query(
+      `DELETE FROM deposits
+       WHERE session_type = 'withdrawal'
+         AND status = 'pending'
+         AND notes LIKE '%Manual admin withdraw%'
+         AND created_at < NOW() - INTERVAL '${STALE_ADMIN_SESSION_TIMEOUT_MINUTES} minutes'`
+    );
+
+    if (staleAdminRes.rowCount > 0) {
+      logger.info(`[SystemCleanup] Purged ${staleAdminRes.rowCount} stale admin pending session(s) older than ${STALE_ADMIN_SESSION_TIMEOUT_MINUTES} minutes.`);
+    }
+
     // --- Purge old cancelled sessions ---
     // This keeps the database size manageable by removing sessions that were never completed.
     const purgeResult = await client.query(
@@ -301,6 +489,7 @@ router.post('/sessions/cleanup', [verifyFirebaseToken, isAdmin], async (req, res
     res.status(200).json({ 
       message: 'Cleanup task completed.', 
       stuckResolved: stuckWithdrawalsRes.rowCount,
+      staleAdminPurged: staleAdminRes.rowCount,
       cancelledPurged: purgeResult.rowCount 
     });
   } catch (error) {

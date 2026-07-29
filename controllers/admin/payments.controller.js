@@ -2,6 +2,7 @@ const { Router } = require('express');
 const logger = require('../../utils/logger.js');
 const poolPromise = require('../../db');
 const { verifyFirebaseToken, isAdmin } = require('../../middleware/auth');
+const { initiateSTKPush, querySTKStatus } = require('../../utils/mpesa');
 
 const router = Router();
 
@@ -205,6 +206,194 @@ router.get('/payments', [verifyFirebaseToken, isAdmin], async (req, res) => {
   } catch (error) {
     logger.error('Failed to get payments for admin:', error);
     res.status(500).json({ error: 'Failed to retrieve payments.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * POST /api/admin/payments/manual-withdraw
+ * @summary Admin manually triggers an M-Pesa STK push withdrawal for a user
+ * @description Creates a manual withdrawal session for the specified user and sends an STK push to their phone number.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         required: [userId, phoneNumber, amount]
+ *         properties:
+ *           userId:
+ *             type: string
+ *             description: Firebase UID of the target user.
+ *           phoneNumber:
+ *             type: string
+ *             description: Phone number to send the STK push to (E.164 or local format).
+ *           amount:
+ *             type: number
+ *             description: Amount in KES to charge.
+ * @responses
+ *   200:
+ *     description: STK push sent successfully.
+ *   400:
+ *     description: Missing required fields.
+ *   500:
+ *     description: Internal server error.
+ */
+router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { userId, phoneNumber, amount } = req.body;
+
+  if (!userId || !phoneNumber || !amount) {
+    return res.status(400).json({ error: 'userId, phoneNumber, and amount are required.' });
+  }
+
+  if (isNaN(amount) || amount < 1) {
+    return res.status(400).json({ error: 'Amount must be a number greater than or equal to 1.' });
+  }
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    // 1. Verify the user exists in our database
+    const userRes = await client.query('SELECT user_id, name, email, phone FROM users WHERE user_id = $1', [userId]);
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ error: `User with ID ${userId} not found.` });
+    }
+
+    // 2. Create a manual withdrawal session
+    const sessionRes = await client.query(
+      `INSERT INTO deposits (user_id, session_type, status, amount)
+       VALUES ($1, 'withdrawal', 'pending', $2)
+       RETURNING id`,
+      [userId, amount]
+    );
+    const sessionId = sessionRes.rows[0].id;
+
+    // 3. Dev mode: skip M-Pesa, auto-approve
+    if (req.user.role === 'developer') {
+      const devCheckoutId = `DEV_MANUAL_${sessionId}_${Date.now()}`;
+      await client.query(
+        "UPDATE deposits SET mpesa_checkout_id = $1, started_at = NOW() WHERE id = $2",
+        [devCheckoutId, sessionId]
+      );
+      // Auto-complete: move to in_progress directly (no callback needed in dev)
+      await client.query(
+        "UPDATE deposits SET status = 'in_progress', completed_at = NOW() WHERE id = $1",
+        [sessionId]
+      );
+      logger.info(`[Admin Manual Withdraw] Dev mode: auto-approved session ${sessionId} for user ${userId}.`);
+      return res.status(200).json({
+        success: true,
+        message: 'Manual withdrawal auto-approved (dev mode).',
+        sessionId,
+        transactionId: devCheckoutId,
+      });
+    }
+
+    // 4. Production: trigger M-Pesa STK push
+    const safePhone = phoneNumber.replace(/[^0-9]/g, '');
+    const mpesaResponse = await initiateSTKPush({
+      phone: safePhone,
+      amount: amount,
+      accountReference: `ADMIN_WD_${sessionId}`,
+      transactionDesc: `Manual WD #${sessionId}`,
+    });
+
+    const checkoutRequestId = mpesaResponse.data.CheckoutRequestID;
+    await client.query(
+      "UPDATE deposits SET mpesa_checkout_id = $1, started_at = NOW() WHERE id = $2",
+      [checkoutRequestId, sessionId]
+    );
+
+    logger.info(`[Admin Manual Withdraw] STK push sent for session ${sessionId} to ${safePhone}. CheckoutRequestID: ${checkoutRequestId}`);
+
+    return res.status(200).json({
+      success: true,
+      message: 'STK push sent to user. Waiting for PIN confirmation.',
+      sessionId,
+      transactionId: checkoutRequestId,
+    });
+  } catch (error) {
+    logger.error('[Admin Manual Withdraw] Failed:', error);
+    return res.status(500).json({ error: 'Failed to initiate manual withdrawal.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/admin/payments/status/:sessionId
+ * @summary Check payment status of a manual withdrawal session
+ * @description Returns the current status of a withdrawal session by its ID.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: sessionId
+ *     required: true
+ *     schema:
+ *       type: integer
+ *     description: The deposit session ID.
+ * @responses
+ *   200:
+ *     description: Payment status.
+ */
+router.get('/payments/status/:sessionId', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { sessionId } = req.params;
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    const sessionRes = await client.query(
+      'SELECT id, status, mpesa_checkout_id, amount, started_at, completed_at FROM deposits WHERE id = $1 AND session_type = $2',
+      [sessionId, 'withdrawal']
+    );
+
+    if (sessionRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Session not found.' });
+    }
+
+    const session = sessionRes.rows[0];
+
+    // Dev checkout IDs are always complete
+    if (session.mpesa_checkout_id && session.mpesa_checkout_id.startsWith('DEV_')) {
+      return res.status(200).json({ success: true, status: session.status, sessionId: session.id });
+    }
+
+    // If already completed or in_progress, payment was received
+    if (session.status === 'in_progress' || session.status === 'completed') {
+      return res.status(200).json({ success: true, status: session.status, sessionId: session.id });
+    }
+
+    // If failed
+    if (session.status === 'failed' || session.status === 'cancelled') {
+      return res.status(200).json({ success: false, status: session.status, sessionId: session.id });
+    }
+
+    // Still pending — optionally self-heal by querying M-Pesa
+    if (session.mpesa_checkout_id && session.started_at) {
+      const secondsSinceStart = (Date.now() - new Date(session.started_at)) / 1000;
+      if (secondsSinceStart > 60) {
+        try {
+          const mpesaResponse = await querySTKStatus(session.mpesa_checkout_id);
+          const { ResultCode } = mpesaResponse.data;
+          if (ResultCode === '0') {
+            await client.query("UPDATE deposits SET status = 'in_progress', completed_at = NOW() WHERE id = $1", [sessionId]);
+            return res.status(200).json({ success: true, status: 'in_progress', sessionId: session.id });
+          }
+        } catch (e) {
+          logger.warn(`[Admin Payment Status] M-Pesa query failed for session ${sessionId}: ${e.message}`);
+        }
+      }
+    }
+
+    return res.status(200).json({ success: false, status: session.status, sessionId: session.id });
+  } catch (error) {
+    logger.error('[Admin Payment Status] Failed:', error);
+    return res.status(500).json({ error: 'Failed to check payment status.', details: error.message });
   } finally {
     client.release();
   }

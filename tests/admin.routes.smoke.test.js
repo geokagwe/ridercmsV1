@@ -89,6 +89,7 @@ describe('Admin Routes Smoke Test', () => {
     { method: 'POST', path: '/booths/:boothUid/slots/:slotIdentifier/command' },
     { method: 'GET', path: '/booths/:boothUid' },
     { method: 'GET', path: '/booths/:boothUid/slots/:slotIdentifier' },
+    { method: 'GET', path: '/booths/:boothUid/slots/:slotIdentifier/withdrawal-info' },
     { method: 'POST', path: '/booths/:boothUid/reset-slots' },
     { method: 'POST', path: '/booths/:boothUid/slots/:slotIdentifier/manual-withdraw' },
 
@@ -101,10 +102,14 @@ describe('Admin Routes Smoke Test', () => {
     { method: 'POST', path: '/simulate/confirm-deposit' },
     { method: 'POST', path: '/simulate/confirm-payment' },
     { method: 'GET', path: '/dashboard-summary' },
+    { method: 'GET', path: '/payments' },
+    { method: 'GET', path: '/payments/status/:sessionId' },
+    { method: 'POST', path: '/payments/manual-withdraw' },
     { method: 'GET', path: '/sessions' },
+    { method: 'POST', path: '/sessions/:sessionId/charge' },
     { method: 'DELETE', path: '/sessions/:sessionId' },
     { method: 'POST', path: '/sessions/cleanup' },
-    { method: 'GET', path: '/payments' },
+    { method: 'GET', path: '/sessions/:sessionId/payment-status' },
   ];
 
   // @ts-ignore

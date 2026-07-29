@@ -4,7 +4,6 @@ const { v4: uuidv4 } = require('uuid');
 const logger = require('../../utils/logger.js');
 const poolPromise = require('../../db');
 const { verifyFirebaseToken, isAdmin } = require('../../middleware/auth');
-const { finalizeWithdrawalSession } = require('../../utils/sessionUtils');
 
 const router = Router();
 
@@ -71,6 +70,7 @@ router.get('/booths', [verifyFirebaseToken, isAdmin], async (req, res) => {
         SELECT d.user_id
         FROM deposits d
         WHERE d.slot_id = s.id AND d.session_type = 'deposit' AND d.status = 'completed'
+          AND d.battery_id = s.current_battery_id
         ORDER BY d.completed_at DESC
         LIMIT 1
       ) last_deposit ON true
@@ -161,6 +161,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
         SELECT d.user_id
         FROM deposits d
         WHERE d.slot_id = s.id AND d.session_type = 'deposit' AND d.status = 'completed'
+          AND d.battery_id = s.current_battery_id
         ORDER BY d.completed_at DESC
         LIMIT 1
       ) last_deposit ON true
@@ -1092,6 +1093,7 @@ router.get('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res)
         SELECT d.user_id
         FROM deposits d
         WHERE d.slot_id = s.id AND d.session_type = 'deposit' AND d.status = 'completed'
+          AND d.battery_id = s.current_battery_id
         ORDER BY d.completed_at DESC
         LIMIT 1
       ) last_deposit ON true
@@ -1367,8 +1369,10 @@ router.post('/booths/:boothUid/reset-slots', [verifyFirebaseToken, isAdmin], asy
 
 /**
  * POST /api/admin/booths/:boothUid/slots/:slotIdentifier/manual-withdraw
- * @summary Manually withdraw a battery from a slot (admin-only, no M-Pesa)
- * @description Creates a completed withdrawal session for a battery left in a slot (e.g., after charging to 100% with no user collection). The admin collects payment physically. This stops charging, calculates the owed amount using the standard pricing, records the revenue, and releases the battery.
+ * @summary Prepare a manual withdrawal session for admin-M-Pesa flow
+ * @description Creates a pending withdrawal session for a battery left in a slot and returns
+ * session details (phone, calculated cost, SOC) so the admin can review and trigger payment
+ * via the /charge endpoint. Charging is stopped. The door is NOT opened yet.
  * @tags [Admin]
  * @security
  *   - bearerAuth: []
@@ -1387,7 +1391,7 @@ router.post('/booths/:boothUid/reset-slots', [verifyFirebaseToken, isAdmin], asy
  *     description: The slot identifier (e.g., slot001).
  * @responses
  *   200:
- *     description: Manual withdrawal completed successfully.
+ *     description: Pending withdrawal session created with details.
  *   400:
  *     description: No deposited battery found in this slot.
  *   404:
@@ -1397,6 +1401,88 @@ router.post('/booths/:boothUid/reset-slots', [verifyFirebaseToken, isAdmin], asy
  *   500:
  *     description: Internal server error.
  */
+router.get('/booths/:boothUid/slots/:slotIdentifier/withdrawal-info', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { boothUid, slotIdentifier } = req.params;
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    const slotRes = await client.query(`
+      SELECT s.id AS "slotId"
+      FROM booth_slots s
+      JOIN booths b ON s.booth_id = b.id
+      WHERE b.booth_uid = $1 AND s.slot_identifier = $2
+    `, [boothUid, slotIdentifier]);
+
+    if (slotRes.rows.length === 0) {
+      return res.status(404).json({ error: `Slot '${slotIdentifier}' in booth '${boothUid}' not found.` });
+    }
+
+    const { slotId } = slotRes.rows[0];
+
+    const depositRes = await client.query(`
+      SELECT d.user_id, d.initial_charge_level, d.completed_at,
+             u.name AS "userName", u.phone AS "userPhone"
+      FROM deposits d
+      JOIN users u ON d.user_id = u.user_id
+      WHERE d.slot_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed'
+      ORDER BY d.completed_at DESC
+      LIMIT 1
+    `, [slotId]);
+
+    if (depositRes.rows.length === 0) {
+      return res.status(400).json({ error: 'No deposited battery found in this slot.' });
+    }
+
+    const { user_id: userId, initial_charge_level: slotInitialSoc, userName, userPhone, completed_at: depositCompletedAt } = depositRes.rows[0];
+
+    const settingsRes = await client.query("SELECT value FROM app_settings WHERE key = 'pricing'");
+    if (settingsRes.rows.length === 0) {
+      return res.status(500).json({ error: 'Pricing settings are not configured.' });
+    }
+
+    const pricingRules = settingsRes.rows[0].value;
+    const baseSwapFee = pricingRules.base_swap_fee;
+    const costPerChargePercent = pricingRules.cost_per_charge_percent;
+
+    const dbChargeRes = await client.query(
+      'SELECT charge_level_percent FROM booth_slots WHERE id = $1',
+      [slotId]
+    );
+    const dbChargeLevel = dbChargeRes.rows[0]?.charge_level_percent;
+
+    const db = getDatabase();
+    const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
+    const snapshot = await slotRef.get();
+    const slotData = snapshot.exists() ? snapshot.val() : null;
+
+    const { extractValidSoc } = require('../booths/shared');
+    const currentChargeLevel = Number(extractValidSoc(slotData, dbChargeLevel) ?? 0);
+
+    const chargeAddedToBattery = Math.max(0, currentChargeLevel - Number(slotInitialSoc || 0));
+    const chargeComponent = chargeAddedToBattery * Number(costPerChargePercent || 0);
+    const totalCost = Number(Math.max(baseSwapFee, chargeComponent).toFixed(2));
+
+    const chargeDurationMs = new Date() - new Date(depositCompletedAt);
+    const chargeDurationMinutes = Math.round(chargeDurationMs / 60000);
+
+    res.status(200).json({
+      userId,
+      userName,
+      userPhone,
+      calculatedAmount: totalCost,
+      socAtDeposit: Number(slotInitialSoc || 0),
+      socCurrent: currentChargeLevel,
+      chargeDurationMinutes,
+    });
+  } catch (error) {
+    logger.error(`Failed to fetch withdrawal info for ${boothUid}/${slotIdentifier}:`, error);
+    res.status(500).json({ error: 'Failed to fetch withdrawal info.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 router.post('/booths/:boothUid/slots/:slotIdentifier/manual-withdraw', [verifyFirebaseToken, isAdmin], async (req, res) => {
   const { boothUid, slotIdentifier } = req.params;
 
@@ -1425,7 +1511,7 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/manual-withdraw', [verifyFi
     // 2. Find the most recent completed deposit on this slot (the battery owner)
     const depositRes = await client.query(`
       SELECT d.id, d.user_id, d.initial_charge_level, d.completed_at,
-             u.name AS "userName"
+             u.name AS "userName", u.phone AS "userPhone"
       FROM deposits d
       JOIN users u ON d.user_id = u.user_id
       WHERE d.slot_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed'
@@ -1438,7 +1524,7 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/manual-withdraw', [verifyFi
       return res.status(400).json({ error: 'No deposited battery found in this slot. No withdrawal session to complete.' });
     }
 
-    const { id: depositCreditId, user_id: userId, initial_charge_level: slotInitialSoc, userName } = depositRes.rows[0];
+    const { id: depositCreditId, user_id: userId, initial_charge_level: slotInitialSoc, userName, userPhone, completed_at: depositCompletedAt } = depositRes.rows[0];
 
     // 3. Guard: ensure there is no active withdrawal on this slot
     const activeWithdrawalRes = await client.query(`
@@ -1484,40 +1570,39 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/manual-withdraw', [verifyFi
     const chargeComponent = chargeAddedToBattery * Number(costPerChargePercent || 0);
     const totalCost = Number(Math.max(baseSwapFee, chargeComponent).toFixed(2));
 
-    // 8. Create withdrawal session (completed) and redeem the deposit credit
+    // 8. Create withdrawal session as PENDING (not completed)
     const insertRes = await client.query(`
       INSERT INTO deposits
-        (user_id, booth_id, slot_id, session_type, status, amount, initial_charge_level, consumed_deposit_id, completed_at, notes)
+        (user_id, booth_id, slot_id, session_type, status, amount, initial_charge_level, consumed_deposit_id, notes)
       VALUES
-        ($1, $2, $3, 'withdrawal', 'completed', $4, $5, $6, NOW(), 'Manual admin withdraw — physical payment collected')
+        ($1, $2, $3, 'withdrawal', 'pending', $4, $5, $6, 'Manual admin withdraw — awaiting M-Pesa payment')
       RETURNING id
     `, [userId, boothId, slotId, totalCost, currentChargeLevel, depositCreditId]);
 
     const newSessionId = insertRes.rows[0].id;
 
-    // 9. Finalize the slot state using the same shared logic as paid withdrawals.
-    // Pass the newSessionId so the CTE matches the just-inserted completed withdrawal
-    // and the deposit credit is properly redeemed.
-    await finalizeWithdrawalSession(client, slotId, slotIdentifier, newSessionId);
-
     await client.query('COMMIT');
 
-    // 10. Send openForCollection to Firebase to release the battery
-    await commandRef.update({ openForCollection: true });
+    const chargeDurationMs = new Date() - new Date(depositCompletedAt);
+    const chargeDurationMinutes = Math.round(chargeDurationMs / 60000);
 
-    logger.info(`Admin (UID: ${req.user.uid}) manually withdrew battery from ${boothUid}/${slotIdentifier}. ` +
-      `Session ${newSessionId} created for user ${userId} (${userName}), amount KES ${totalCost}.`);
+    logger.info(`Admin (UID: ${req.user.uid}) prepared manual withdraw session ${newSessionId} for ${boothUid}/${slotIdentifier}. ` +
+      `User: ${userId} (${userName}), amount KES ${totalCost}.`);
 
     res.status(200).json({
-      message: `Manual withdrawal completed for slot ${slotIdentifier}. Door released.`,
+      message: `Pending withdrawal session created for slot ${slotIdentifier}. Ready for M-Pesa payment.`,
       sessionId: newSessionId,
-      user: { id: userId, name: userName },
-      amount: totalCost,
+      userName,
+      userPhone,
+      calculatedAmount: totalCost,
+      socAtDeposit: Number(slotInitialSoc || 0),
+      socCurrent: currentChargeLevel,
+      chargeDurationMinutes,
     });
   } catch (error) {
     await client.query('ROLLBACK');
     logger.error(`Failed manual withdrawal for ${boothUid}/${slotIdentifier}:`, error);
-    res.status(500).json({ error: 'Failed to complete manual withdrawal.', details: error.message });
+    res.status(500).json({ error: 'Failed to prepare manual withdrawal.', details: error.message });
   } finally {
     client.release();
   }
