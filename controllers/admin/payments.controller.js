@@ -244,7 +244,7 @@ router.get('/payments', [verifyFirebaseToken, isAdmin], async (req, res) => {
  *     description: Internal server error.
  */
 router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (req, res) => {
-  const { userId, phoneNumber, amount } = req.body;
+  const { userId, phoneNumber, amount, boothUid, slotIdentifier } = req.body;
 
   if (!userId || !phoneNumber || !amount) {
     return res.status(400).json({ error: 'userId, phoneNumber, and amount are required.' });
@@ -263,13 +263,38 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
       return res.status(404).json({ error: `User with ID ${userId} not found.` });
     }
 
-    // 2. Create a manual withdrawal session
-    const sessionRes = await client.query(
-      `INSERT INTO deposits (user_id, session_type, status, amount)
-       VALUES ($1, 'withdrawal', 'pending', $2)
-       RETURNING id`,
-      [userId, amount]
-    );
+    // 2. Resolve booth and slot if provided
+    let boothId = null;
+    let slotId = null;
+    if (boothUid && slotIdentifier) {
+      const slotRes = await client.query(`
+        SELECT s.id AS "slotId", b.id AS "boothId"
+        FROM booth_slots s
+        JOIN booths b ON s.booth_id = b.id
+        WHERE b.booth_uid = $1 AND s.slot_identifier = $2
+      `, [boothUid, slotIdentifier]);
+      if (slotRes.rows.length > 0) {
+        boothId = slotRes.rows[0].boothId;
+        slotId = slotRes.rows[0].slotId;
+      }
+    }
+
+    // 3. Create a manual withdrawal session
+    let insertQuery, insertParams;
+    if (boothId && slotId) {
+      insertQuery = `INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status, amount)
+                     VALUES ($1, $2, $3, 'withdrawal', 'pending', $4)
+                     RETURNING id`;
+      insertParams = [userId, boothId, slotId, amount];
+    } else {
+      // Fallback for standalone usage (no slot context) — omit booth/slot
+      insertQuery = `INSERT INTO deposits (user_id, session_type, status, amount)
+                     VALUES ($1, 'withdrawal', 'pending', $2)
+                     RETURNING id`;
+      insertParams = [userId, amount];
+    }
+
+    const sessionRes = await client.query(insertQuery, insertParams);
     const sessionId = sessionRes.rows[0].id;
 
     // 3. Dev mode: skip M-Pesa, auto-approve
