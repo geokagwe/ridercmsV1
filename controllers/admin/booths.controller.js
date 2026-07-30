@@ -167,7 +167,9 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
         LIMIT 1
       ) last_deposit ON true
       LEFT JOIN users u ON last_deposit.user_id = u.user_id
-      -- Detect completed or in-progress manual withdrawals pending unlock (within last 24h)
+      -- Detect completed or in-progress manual withdrawals pending unlock (within last 24h).
+      -- Only flag if the slot still has a battery (current_battery_id IS NOT NULL), so
+      -- already-unlocked slots don't show the alert.
       LEFT JOIN LATERAL (
         SELECT d.id AS manual_withdrawal_id
         FROM deposits d
@@ -176,6 +178,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
           AND d.status IN ('completed', 'in_progress')
           AND d.notes = 'manual_withdrawal'
           AND (d.completed_at > NOW() - INTERVAL '24 hours' OR d.started_at > NOW() - INTERVAL '24 hours')
+          AND s.current_battery_id IS NOT NULL
         ORDER BY d.created_at DESC
         LIMIT 1
       ) manual_wd ON true
@@ -981,6 +984,8 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/command', [verifyFirebaseTo
 
       // If no in_progress withdrawal was found, mark any orphaned completed deposit on this slot
       // as 'failed' so it doesn't appear as an active session to the user.
+      // Also clear the notes on stale manual-withdrawal sessions so the pending_manual_unlock
+      // query stops flagging them.
       if (updateResult.rowCount === 0) {
         await pgClient.query(`
           UPDATE deposits
@@ -992,6 +997,19 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/command', [verifyFirebaseTo
             WHERE b.booth_uid = $1 AND s.slot_identifier = $2
           )
             AND session_type = 'deposit' AND status = 'completed'
+        `, [boothUid, slotIdentifier]);
+
+        await pgClient.query(`
+          UPDATE deposits
+          SET notes = COALESCE(notes, '') || '\n[' || NOW() || '] Slot force-unlocked — already completed.'
+          WHERE slot_id = (
+            SELECT s.id FROM booth_slots s
+            JOIN booths b ON s.booth_id = b.id
+            WHERE b.booth_uid = $1 AND s.slot_identifier = $2
+          )
+            AND session_type = 'withdrawal'
+            AND status = 'completed'
+            AND notes = 'manual_withdrawal'
         `, [boothUid, slotIdentifier]);
       }
 
