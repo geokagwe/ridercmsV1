@@ -282,14 +282,14 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
     // 3. Create a manual withdrawal session
     let insertQuery, insertParams;
     if (boothId && slotId) {
-      insertQuery = `INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status, amount)
-                     VALUES ($1, $2, $3, 'withdrawal', 'pending', $4)
+      insertQuery = `INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status, amount, notes)
+                     VALUES ($1, $2, $3, 'withdrawal', 'pending', $4, 'manual_withdrawal')
                      RETURNING id`;
       insertParams = [userId, boothId, slotId, amount];
     } else {
       // Fallback for standalone usage (no slot context) — omit booth/slot
-      insertQuery = `INSERT INTO deposits (user_id, session_type, status, amount)
-                     VALUES ($1, 'withdrawal', 'pending', $2)
+      insertQuery = `INSERT INTO deposits (user_id, session_type, status, amount, notes)
+                     VALUES ($1, 'withdrawal', 'pending', $2, 'manual_withdrawal')
                      RETURNING id`;
       insertParams = [userId, amount];
     }
@@ -301,13 +301,39 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
     if (req.user.role === 'developer') {
       const devCheckoutId = `DEV_MANUAL_${sessionId}_${Date.now()}`;
       await client.query(
-        "UPDATE deposits SET mpesa_checkout_id = $1, started_at = NOW() WHERE id = $2",
+        "UPDATE deposits SET mpesa_checkout_id = $1, started_at = NOW(), notes = 'manual_withdrawal' WHERE id = $2",
         [devCheckoutId, sessionId]
       );
-      // Auto-complete: move to in_progress directly (no callback needed in dev)
+      // Auto-complete: mark as completed (settled, no further action needed)
       await client.query(
-        "UPDATE deposits SET status = 'in_progress', completed_at = NOW() WHERE id = $1",
+        "UPDATE deposits SET status = 'completed', completed_at = NOW() WHERE id = $1",
         [sessionId]
+      );
+      // Insert a synthetic callback record so it shows in the Payments page
+      await client.query(
+        `INSERT INTO mpesa_callbacks (callback_type, payload, processing_notes)
+         VALUES ($1, $2, $3)`,
+        [
+          'stk_push',
+          JSON.stringify({
+            Body: {
+              stkCallback: {
+                MerchantRequestID: `MANUAL_${sessionId}`,
+                CheckoutRequestID: devCheckoutId,
+                ResultCode: 0,
+                ResultDesc: 'The service request is processed successfully.',
+                CallbackMetadata: {
+                  Item: [
+                    { Name: 'Amount', Value: amount },
+                    { Name: 'MpesaReceiptNumber', Value: devCheckoutId },
+                    { Name: 'PhoneNumber', Value: parseInt(phoneNumber.replace(/[^0-9]/g, '')) },
+                  ]
+                }
+              }
+            }
+          }),
+          `Result: 0 - Success. Receipt: ${devCheckoutId}. Paid: KES ${amount}. Manual withdrawal (dev).`
+        ]
       );
       logger.info(`[Admin Manual Withdraw] Dev mode: auto-approved session ${sessionId} for user ${userId}.`);
       return res.status(200).json({

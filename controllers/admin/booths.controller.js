@@ -153,7 +153,8 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
       SELECT
         b.booth_uid, b.name, b.location_address, b.status, b.updated_at,
         s.slot_identifier,
-        u.name AS user_name
+        u.name AS user_name,
+        manual_wd.manual_withdrawal_id IS NOT NULL AS pending_manual_unlock
       FROM booths b
       LEFT JOIN booth_slots s ON b.id = s.booth_id
       -- Use a lateral join to find the user from the most recent completed deposit in each slot.
@@ -166,6 +167,18 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
         LIMIT 1
       ) last_deposit ON true
       LEFT JOIN users u ON last_deposit.user_id = u.user_id
+      -- Detect completed manual withdrawals pending unlock (within last 24h)
+      LEFT JOIN LATERAL (
+        SELECT d.id AS manual_withdrawal_id
+        FROM deposits d
+        WHERE d.slot_id = s.id
+          AND d.session_type = 'withdrawal'
+          AND d.status = 'completed'
+          AND d.notes = 'manual_withdrawal'
+          AND d.completed_at > NOW() - INTERVAL '24 hours'
+        ORDER BY d.completed_at DESC
+        LIMIT 1
+      ) manual_wd ON true
       ORDER BY b.name, s.slot_identifier;
     `);
     const boothsFromDb = boothsResult.rows;
@@ -185,17 +198,19 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
             status: row.status,
             updated_at: row.updated_at
           },
-          slotUserMap: {}
+          slotUserMap: {},
+          slotManualUnlockMap: {}
         };
       }
       if (row.slot_identifier) {
         acc[row.booth_uid].slotUserMap[row.slot_identifier] = row.user_name;
+        acc[row.booth_uid].slotManualUnlockMap[row.slot_identifier] = row.pending_manual_unlock;
       }
       return acc;
     }, {});
 
     // 2. Fetch real-time data from Firebase for each unique booth.
-    const boothStatusPromises = Object.values(groupedBooths).map(async ({ details: booth, slotUserMap }) => {
+    const boothStatusPromises = Object.values(groupedBooths).map(async ({ details: booth, slotUserMap, slotManualUnlockMap }) => {
       const boothRef = db.ref(`booths/${booth.booth_uid}`);
       const snapshot = await boothRef.get();
 
@@ -226,6 +241,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
               relayState: telemetry.relayOn ? 'ON' : 'OFF',
               isCharging: isCharging,
               userName: slotUserMap[slotIdentifier] || null, // Add user's name here
+              pendingManualUnlock: slotManualUnlockMap[slotIdentifier] || false,
               telemetry: telemetry,
               // The battery object contains the most up-to-date info
               battery: {
