@@ -167,16 +167,16 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
         LIMIT 1
       ) last_deposit ON true
       LEFT JOIN users u ON last_deposit.user_id = u.user_id
-      -- Detect completed manual withdrawals pending unlock (within last 24h)
+      -- Detect completed or in-progress manual withdrawals pending unlock (within last 24h)
       LEFT JOIN LATERAL (
         SELECT d.id AS manual_withdrawal_id
         FROM deposits d
         WHERE d.slot_id = s.id
           AND d.session_type = 'withdrawal'
-          AND d.status = 'completed'
+          AND d.status IN ('completed', 'in_progress')
           AND d.notes = 'manual_withdrawal'
-          AND d.completed_at > NOW() - INTERVAL '24 hours'
-        ORDER BY d.completed_at DESC
+          AND (d.completed_at > NOW() - INTERVAL '24 hours' OR d.started_at > NOW() - INTERVAL '24 hours')
+        ORDER BY d.created_at DESC
         LIMIT 1
       ) manual_wd ON true
       ORDER BY b.name, s.slot_identifier;

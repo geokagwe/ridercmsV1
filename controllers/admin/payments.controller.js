@@ -279,13 +279,27 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
       }
     }
 
-    // 3. Create a manual withdrawal session
+    // 3. Resolve the original deposit credit to link as consumed_deposit_id
+    let consumedDepositId = null;
+    if (slotId) {
+      const depositCreditRes = await client.query(`
+        SELECT d.id FROM deposits d
+        WHERE d.slot_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed'
+        ORDER BY d.completed_at DESC
+        LIMIT 1
+      `, [slotId]);
+      if (depositCreditRes.rows.length > 0) {
+        consumedDepositId = depositCreditRes.rows[0].id;
+      }
+    }
+
+    // 4. Create a manual withdrawal session
     let insertQuery, insertParams;
     if (boothId && slotId) {
-      insertQuery = `INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status, amount, notes)
-                     VALUES ($1, $2, $3, 'withdrawal', 'pending', $4, 'manual_withdrawal')
+      insertQuery = `INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status, amount, consumed_deposit_id, notes)
+                     VALUES ($1, $2, $3, 'withdrawal', 'pending', $4, $5, 'manual_withdrawal')
                      RETURNING id`;
-      insertParams = [userId, boothId, slotId, amount];
+      insertParams = [userId, boothId, slotId, amount, consumedDepositId];
     } else {
       // Fallback for standalone usage (no slot context) — omit booth/slot
       insertQuery = `INSERT INTO deposits (user_id, session_type, status, amount, notes)
@@ -297,17 +311,12 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
     const sessionRes = await client.query(insertQuery, insertParams);
     const sessionId = sessionRes.rows[0].id;
 
-    // 3. Dev mode: skip M-Pesa, auto-approve
+    // 5. Dev mode: skip M-Pesa, auto-approve
     if (req.user.role === 'developer') {
       const devCheckoutId = `DEV_MANUAL_${sessionId}_${Date.now()}`;
       await client.query(
-        "UPDATE deposits SET mpesa_checkout_id = $1, started_at = NOW(), notes = 'manual_withdrawal' WHERE id = $2",
+        "UPDATE deposits SET mpesa_checkout_id = $1, started_at = NOW(), status = 'in_progress', notes = 'manual_withdrawal' WHERE id = $2",
         [devCheckoutId, sessionId]
-      );
-      // Auto-complete: mark as completed (settled, no further action needed)
-      await client.query(
-        "UPDATE deposits SET status = 'completed', completed_at = NOW() WHERE id = $1",
-        [sessionId]
       );
       // Insert a synthetic callback record so it shows in the Payments page
       await client.query(
@@ -344,7 +353,7 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
       });
     }
 
-    // 4. Production: trigger M-Pesa STK push
+    // 6. Production: trigger M-Pesa STK push
     const safePhone = phoneNumber.replace(/[^0-9]/g, '');
     const mpesaResponse = await initiateSTKPush({
       phone: safePhone,
