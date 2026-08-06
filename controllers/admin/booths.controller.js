@@ -59,6 +59,7 @@ router.get('/booths', [verifyFirebaseToken, isAdmin], async (req, res) => {
         s.slot_identifier, s.status as slot_status, s.door_status, s.charge_level_percent as slot_charge_level,
         bat.battery_uid,
         u.name AS user_name,
+        u.phone AS user_phone,
         COUNT(*) OVER() as total_booths
       FROM (
         SELECT * FROM booths ORDER BY created_at DESC LIMIT $1 OFFSET $2
@@ -111,7 +112,8 @@ router.get('/booths', [verifyFirebaseToken, isAdmin], async (req, res) => {
           doorStatus: row.door_status,
           chargeLevel: row.slot_charge_level,
           batteryUid: row.battery_uid,
-          userName: row.user_name
+          userName: row.user_name,
+          userPhone: row.user_phone
         });
         booth.slotCount++;
       }
@@ -154,6 +156,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
         b.booth_uid, b.name, b.location_address, b.status, b.updated_at,
         s.slot_identifier,
         u.name AS user_name,
+        u.phone AS user_phone,
         manual_wd.manual_withdrawal_id IS NOT NULL AS pending_manual_unlock
       FROM booths b
       LEFT JOIN booth_slots s ON b.id = s.booth_id
@@ -202,18 +205,20 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
             updated_at: row.updated_at
           },
           slotUserMap: {},
+          slotUserPhoneMap: {},
           slotManualUnlockMap: {}
         };
       }
       if (row.slot_identifier) {
         acc[row.booth_uid].slotUserMap[row.slot_identifier] = row.user_name;
+        acc[row.booth_uid].slotUserPhoneMap[row.slot_identifier] = row.user_phone;
         acc[row.booth_uid].slotManualUnlockMap[row.slot_identifier] = row.pending_manual_unlock;
       }
       return acc;
     }, {});
 
     // 2. Fetch real-time data from Firebase for each unique booth.
-    const boothStatusPromises = Object.values(groupedBooths).map(async ({ details: booth, slotUserMap, slotManualUnlockMap }) => {
+    const boothStatusPromises = Object.values(groupedBooths).map(async ({ details: booth, slotUserMap, slotUserPhoneMap, slotManualUnlockMap }) => {
       const boothRef = db.ref(`booths/${booth.booth_uid}`);
       const snapshot = await boothRef.get();
 
@@ -244,6 +249,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
               relayState: telemetry.relayOn ? 'ON' : 'OFF',
               isCharging: isCharging,
               userName: slotUserMap[slotIdentifier] || null, // Add user's name here
+              userPhone: slotUserPhoneMap[slotIdentifier] || null,
               pendingManualUnlock: slotManualUnlockMap[slotIdentifier] || false,
               telemetry: telemetry,
               // The battery object contains the most up-to-date info
@@ -1120,7 +1126,8 @@ router.get('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res)
         s.door_status,
         s.charge_level_percent,
         bat.battery_uid,
-        u.name AS user_name
+        u.name AS user_name,
+        u.phone AS user_phone
       FROM booth_slots s
       LEFT JOIN batteries bat ON s.current_battery_id = bat.id
       LEFT JOIN LATERAL (
@@ -1151,7 +1158,8 @@ router.get('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res)
         doorStatus: slot.door_status,
         chargeLevel: slot.charge_level_percent,
         batteryUid: slot.battery_uid,
-        userName: slot.user_name
+        userName: slot.user_name,
+        userPhone: slot.user_phone
       }))
     });
   } catch (error) {
