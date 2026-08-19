@@ -262,4 +262,49 @@ router.delete('/users/:uid', [verifyFirebaseToken, isAdmin], async (req, res) =>
   }
 });
 
+/**
+ * POST /api/admin/users/:uid/reset-password
+ * @summary Send a password reset email to a user
+ * @description Generates a Firebase password reset link for the specified user and sends it to their email. Only accessible by admins.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: uid
+ *     required: true
+ *     schema:
+ *       type: string
+ *     description: The Firebase UID of the user to reset the password for.
+ * @responses
+ *   200:
+ *     description: Password reset email sent successfully.
+ *   404:
+ *     description: User not found.
+ *   500:
+ *     description: Internal server error.
+ */
+router.post('/users/:uid/reset-password', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { uid } = req.params;
+
+  try {
+    const userRecord = await admin.auth().getUser(uid);
+
+    if (!userRecord.email) {
+      return res.status(400).json({ error: 'This user has no email address associated with their account.' });
+    }
+
+    const resetLink = await admin.auth().generatePasswordResetLink(userRecord.email);
+
+    logger.info(`Admin (UID: ${req.user.uid}) triggered password reset for user (UID: ${uid}, email: ${userRecord.email}).`);
+    res.status(200).json({ message: `Password reset email sent to ${userRecord.email}.`, resetLink });
+  } catch (error) {
+    if (error.code === 'auth/user-not-found') {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    logger.error(`Failed to generate password reset link for user ${uid}:`, error);
+    res.status(500).json({ error: 'Failed to send password reset email.', details: error.message });
+  }
+});
+
 module.exports = router;
