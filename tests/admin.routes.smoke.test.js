@@ -77,6 +77,7 @@ describe('Admin Routes Smoke Test', () => {
     { method: 'GET', path: '/users' },
     { method: 'POST', path: '/users/set-status' },
     { method: 'DELETE', path: '/users/:uid' },
+    { method: 'POST', path: '/users/:uid/reset-password' },
 
     { method: 'GET', path: '/booths' },
     { method: 'GET', path: '/booths/status' },

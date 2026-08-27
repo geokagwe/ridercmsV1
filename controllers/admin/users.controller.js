@@ -104,27 +104,37 @@ router.post('/users/set-role', [verifyFirebaseToken, isAdmin], async (req, res) 
  *               type: string
  */
 router.get('/users', [verifyFirebaseToken, isAdmin], async (req, res) => {
-  const pageSize = Math.min(parseInt(req.query.pageSize, 10) || 100, 1000);
-  const pageToken = req.query.pageToken || undefined;
-
   try {
-    const listUsersResult = await admin.auth().listUsers(pageSize, pageToken);
+    // Loop through Firebase pagination internally so the admin always sees ALL users.
+    // Firebase listUsers() returns at most 1000 users per call.
+    const allUsers = [];
+    let pageToken;
+    let pageCount = 0;
 
-    // Map the full user records to a more concise format for the response.
-    const users = listUsersResult.users.map(userRecord => ({
-      uid: userRecord.uid,
-      email: userRecord.email,
-      displayName: userRecord.displayName,
-      phoneNumber: userRecord.phoneNumber,
-      role: userRecord.customClaims?.role || 'customer', // Default to 'customer' if no role is set
-      disabled: userRecord.disabled,
-      creationTime: userRecord.metadata.creationTime,
-      lastSignInTime: userRecord.metadata.lastSignInTime,
-    }));
+    do {
+      const listUsersResult = await admin.auth().listUsers(1000, pageToken);
+      const mappedUsers = listUsersResult.users.map(userRecord => ({
+        uid: userRecord.uid,
+        email: userRecord.email,
+        displayName: userRecord.displayName,
+        phoneNumber: userRecord.phoneNumber,
+        role: userRecord.customClaims?.role || 'customer', // Default to 'customer' if no role is set
+        disabled: userRecord.disabled,
+        creationTime: userRecord.metadata.creationTime,
+        lastSignInTime: userRecord.metadata.lastSignInTime,
+      }));
+      allUsers.push(...mappedUsers);
+      pageToken = listUsersResult.pageToken;
+      pageCount += 1;
+
+      // Safety cap to avoid an unbounded loop on extremely large user bases.
+      if (pageCount >= 100) break;
+    } while (pageToken);
 
     res.status(200).json({
-      users,
-      nextPageToken: listUsersResult.pageToken, // Send this token back to the client for the next request
+      users: allUsers,
+      nextPageToken: undefined, // All users are returned in a single response now.
+      total: allUsers.length,
     });
   } catch (error) {
     logger.error('Failed to list users:', error);
