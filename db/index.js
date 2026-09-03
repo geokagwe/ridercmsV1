@@ -1,0 +1,270 @@
+const { Pool } = require('pg');
+const { Connector } = require('@google-cloud/cloud-sql-connector');
+const logger = require('../utils/logger');
+const schemaStorage = require('../utils/schemaStorage');
+
+let pool;
+const connector = new Connector();
+
+/**
+ * Parses a string value into a boolean.
+ * @param {string} value - The value to parse.
+ * @returns {boolean|null} The parsed boolean value, or null if it cannot be parsed.
+ */
+function parseBoolean(value) {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+  return null;
+}
+
+/**
+ * Parses a string value into a positive integer.
+ * @param {string|number} value - The value to parse.
+ * @param {number} fallback - The fallback value if parsing fails.
+ * @returns {number} The parsed positive integer or the fallback.
+ */
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * Gets the Cloud SQL instance connection name from environment variables.
+ * @returns {string|undefined} The instance connection name.
+ */
+function getInstanceConnectionName() {
+  const instanceFromLegacy = process.env.INSTANCE_CONNECTION_NAME;
+  const instanceFromDb = process.env.DB_INSTANCE_CONNECTION_NAME;
+
+  if (instanceFromLegacy && instanceFromDb && instanceFromLegacy !== instanceFromDb) {
+    logger.warn(
+      `Both INSTANCE_CONNECTION_NAME and DB_INSTANCE_CONNECTION_NAME are set with different values. `
+      + `Using INSTANCE_CONNECTION_NAME="${instanceFromLegacy}".`
+    );
+  }
+
+  return instanceFromLegacy || instanceFromDb;
+}
+
+/**
+ * Gets the database connection mode from environment variables.
+ * @returns {string} The connection mode ('auto', 'database_url', or 'cloudsql_connector').
+ */
+function getConnectionMode() {
+  return (process.env.DB_CONNECTION_MODE || 'auto').toLowerCase();
+}
+
+/**
+ * Validates the format of a Cloud SQL instance connection name.
+ * @param {string} instanceConnectionName - The connection name to validate.
+ * @throws {Error} If the format is invalid.
+ */
+function validateInstanceConnectionName(instanceConnectionName) {
+  const parts = String(instanceConnectionName).split(':');
+  if (parts.length !== 3 || parts.some((part) => !part.trim())) {
+    throw new Error(
+      `Invalid DB instance connection name "${instanceConnectionName}". `
+      + 'Expected format: "project-id:region:instance-name".'
+    );
+  }
+}
+
+/**
+ * Creates a PostgreSQL connection pool from a connection string.
+ * @param {string} connectionString - The DATABASE_URL connection string.
+ * @returns {Pool} The configured PostgreSQL connection pool.
+ */
+function createPoolFromDatabaseUrl(connectionString) {
+  const sslFromEnv = parseBoolean(process.env.DB_SSL);
+  const needsSslByDefault = Boolean(connectionString)
+    && (connectionString.includes('render.com') || connectionString.includes('google'));
+  const enableSsl = sslFromEnv === null ? needsSslByDefault : sslFromEnv;
+  const poolMax = parsePositiveInt(process.env.DB_POOL_MAX, 10);
+  const idleTimeoutMillis = parsePositiveInt(process.env.DB_POOL_IDLE_TIMEOUT_MS, 30000);
+  const connectionTimeoutMillis = parsePositiveInt(process.env.DB_POOL_CONNECTION_TIMEOUT_MS, 15000);
+
+  logger.info('Configuring database connection via DATABASE_URL.');
+  logger.info(
+    `DB pool settings: max=${poolMax}, idleTimeoutMillis=${idleTimeoutMillis}, connectionTimeoutMillis=${connectionTimeoutMillis}`
+  );
+  return new Pool({
+    connectionString,
+    ssl: enableSsl ? { rejectUnauthorized: false } : false,
+    max: poolMax,
+    idleTimeoutMillis,
+    connectionTimeoutMillis,
+    keepAlive: true,
+  });
+}
+
+/**
+ * Checks if a given error is related to Cloud SQL authentication.
+ * @param {Error|string} err - The error to check.
+ * @returns {boolean} True if it's a Cloud SQL auth error.
+ */
+function isCloudSqlAuthError(err) {
+  const message = String(err && err.message ? err.message : err);
+  return (
+    message.includes('NOT_AUTHORIZED')
+    || message.includes('cloudsql.instances.get')
+    || message.includes('cloudsql.instances.connect')
+  );
+}
+
+/**
+ * Wraps a Cloud SQL error with more helpful context if it's an auth error.
+ * @param {Error} err - The original error.
+ * @param {string} instanceConnectionName - The connection name being used.
+ * @returns {Error} The original or enhanced error.
+ */
+function wrapCloudSqlError(err, instanceConnectionName) {
+  if (!isCloudSqlAuthError(err)) return err;
+
+  const enhanced = new Error(
+    `Cloud SQL connector auth failed for "${instanceConnectionName}". `
+    + 'Grant the runtime identity roles/cloudsql.client, verify the instance name, '
+    + 'or use DB_CONNECTION_MODE=database_url with DATABASE_URL for direct Postgres access.'
+  );
+  enhanced.cause = err;
+  return enhanced;
+}
+
+/**
+ * Creates a PostgreSQL connection pool using the Cloud SQL Connector.
+ * @param {string} instanceConnectionName - The Cloud SQL instance connection name.
+ * @returns {Promise<Pool>} The configured PostgreSQL connection pool.
+ */
+async function createPoolFromCloudSql(instanceConnectionName) {
+  validateInstanceConnectionName(instanceConnectionName);
+  logger.info(`Configuring database connection via Google Cloud SQL Connector for "${instanceConnectionName}".`);
+
+  const clientOpts = await connector.getOptions({
+    instanceConnectionName,
+    ipType: process.env.DB_IP_TYPE || 'PUBLIC',
+  });
+
+  const poolMax = parsePositiveInt(process.env.DB_POOL_MAX, 5);
+  const idleTimeoutMillis = parsePositiveInt(process.env.DB_POOL_IDLE_TIMEOUT_MS, 30000);
+  const connectionTimeoutMillis = parsePositiveInt(process.env.DB_POOL_CONNECTION_TIMEOUT_MS, 15000);
+
+  logger.info(
+    `DB pool settings: max=${poolMax}, idleTimeoutMillis=${idleTimeoutMillis}, connectionTimeoutMillis=${connectionTimeoutMillis}`
+  );
+
+  const cloudSqlPool = new Pool({
+    ...clientOpts,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    // --- POOL SETTINGS ---
+    max: poolMax,                   // Keep this controlled for Cloud Run.
+    idleTimeoutMillis,              // Close idle clients after configured timeout.
+    connectionTimeoutMillis,        // Avoid false-positive timeouts during brief bursts.
+    keepAlive: true,                // Send TCP keep-alive packets.
+    // -------------------
+  });
+
+  // Used by server shutdown hook when present.
+  cloudSqlPool.connector = connector;
+  return cloudSqlPool;
+}
+
+/**
+ * Configures and returns a database pool based on environment settings.
+ * @returns {Promise<Pool>} The configured database pool.
+ */
+async function configurePool() {
+  const mode = getConnectionMode();
+  const connectionString = process.env.DATABASE_URL;
+  const instanceConnectionName = getInstanceConnectionName();
+
+  if (!['auto', 'database_url', 'cloudsql_connector'].includes(mode)) {
+    throw new Error(
+      `Invalid DB_CONNECTION_MODE "${process.env.DB_CONNECTION_MODE}". `
+      + 'Use one of: auto, database_url, cloudsql_connector.'
+    );
+  }
+
+  if (mode === 'database_url') {
+    if (!connectionString) {
+      throw new Error('DB_CONNECTION_MODE=database_url requires DATABASE_URL.');
+    }
+    return createPoolFromDatabaseUrl(connectionString);
+  }
+
+  if (mode === 'cloudsql_connector') {
+    if (!instanceConnectionName) {
+      throw new Error(
+        'DB_CONNECTION_MODE=cloudsql_connector requires DB_INSTANCE_CONNECTION_NAME (or INSTANCE_CONNECTION_NAME).'
+      );
+    }
+    try {
+      return await createPoolFromCloudSql(instanceConnectionName);
+    } catch (err) {
+      throw wrapCloudSqlError(err, instanceConnectionName);
+    }
+  }
+
+  // Auto mode:
+  // 1) Prefer DATABASE_URL when present (Render/direct Postgres)
+  // 2) Otherwise try Cloud SQL connector
+  if (connectionString) {
+    return createPoolFromDatabaseUrl(connectionString);
+  }
+
+  if (instanceConnectionName) {
+    try {
+      return await createPoolFromCloudSql(instanceConnectionName);
+    } catch (err) {
+      throw wrapCloudSqlError(err, instanceConnectionName);
+    }
+  }
+
+  throw new Error(
+    'No DB config found. Set DATABASE_URL, or DB_INSTANCE_CONNECTION_NAME/INSTANCE_CONNECTION_NAME.'
+  );
+}
+// Graceful shutdown handler
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM signal received: closing HTTP server and DB pool');
+  if (pool) {
+    await pool.end();
+    logger.info('Database pool closed');
+  }
+  if (connector) {
+    connector.close();
+    logger.info('Cloud SQL Connector closed');
+  }
+  process.exit(0);
+});
+
+module.exports = (async () => {
+  pool = await configurePool();
+
+  const _originalConnect = pool.connect.bind(pool);
+  pool.connect = async (schema) => {
+    const client = await _originalConnect();
+    const effectiveSchema = schema || schemaStorage.getStore() || 'public';
+    if (effectiveSchema !== 'public') {
+      await client.query(`SET search_path TO ${effectiveSchema}`);
+    }
+    const _originalRelease = client.release.bind(client);
+    client.release = (...args) => {
+      client.query(`SET search_path TO public`).catch(() => {});
+      return _originalRelease(...args);
+    };
+    return client;
+  };
+
+  pool.on('connect', () => {
+    logger.debug('New database client connected to the pool.');
+  });
+
+  pool.on('error', (err) => {
+    logger.error('Unexpected error on idle database client', err);
+  });
+
+  return pool;
+})();

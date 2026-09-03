@@ -1,0 +1,671 @@
+const { Router } = require('express');
+const { admin } = require('../utils/firebase'); // Use the initialized admin instance
+const logger = require('../utils/logger');
+const poolPromise = require('../db'); // Import the PostgreSQL connection pool
+const { verifyFirebaseToken } = require('../middleware/auth'); // We will create this new middleware
+const uploadToGcsMiddleware = require('../middleware/upload');
+const axios = require('axios'); // For making HTTP requests to Google's reCAPTCHA service
+const router = Router();
+
+/**
+ * Extracts unique authentication provider IDs for a user from their token and record.
+ * @param {object} decodedToken - The decoded Firebase ID token.
+ * @param {import('firebase-admin/auth').UserRecord} userRecord - The Firebase user record.
+ * @returns {Set<string>} A set of provider IDs (e.g., 'password', 'google.com').
+ */
+function getFirebaseProviderIds(decodedToken, userRecord) {
+  const tokenProviders = decodedToken.firebase && decodedToken.firebase.identities
+    ? Object.keys(decodedToken.firebase.identities)
+    : [];
+  const recordProviders = userRecord && Array.isArray(userRecord.providerData)
+    ? userRecord.providerData.map((provider) => provider.providerId)
+    : [];
+
+  return new Set([...tokenProviders, ...recordProviders]);
+}
+
+/**
+ * Checks if the user signed in with Google.
+ * @param {object} decodedToken - The decoded Firebase ID token.
+ * @param {import('firebase-admin/auth').UserRecord} userRecord - The Firebase user record.
+ * @returns {boolean} True if Google sign-in was used.
+ */
+function isGoogleSignIn(decodedToken, userRecord) {
+  return getFirebaseProviderIds(decodedToken, userRecord).has('google.com');
+}
+
+/**
+ * Normalizes a string by trimming it, or returns an empty string if not a string.
+ * @param {any} value - The value to normalize.
+ * @returns {string} The normalized string.
+ */
+function normalizeString(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/**
+ * Verifies a Google reCAPTCHA v3 token.
+ * @param {string} token The reCAPTCHA token from the client.
+ * @returns {Promise<boolean>} True if the token is valid and the score is above the threshold.
+ */
+async function verifyRecaptcha(token) {
+  const secret = process.env.RECAPTCHA_SECRET_KEY;
+  if (!secret) {
+    logger.error('RECAPTCHA_SECRET_KEY is not set in environment variables. Skipping verification.');
+    // In a production environment, you should fail hard here.
+    // For development, we can allow it to pass.
+    return process.env.NODE_ENV !== 'production';
+  }
+
+  const verificationUrl = 'https://www.google.com/recaptcha/api/siteverify';
+
+  try {
+    const response = await axios.post(verificationUrl, new URLSearchParams({
+      secret: secret,
+      response: token,
+    }));
+
+    const { success, score } = response.data;
+    return success && score >= 0.5;
+  } catch (error) {
+    logger.error('Error verifying reCAPTCHA token:', error);
+    return false;
+  }
+}
+
+// --- 1. User Registration Endpoint ---
+/**
+ * @swagger
+ * /api/auth/register:
+ *   post:
+ *     summary: Register a new user
+ *     tags: [Authentication]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *               - password
+ *               - name
+ *               - recaptchaToken
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *                 description: User's email address.
+ *               password:
+ *                 type: string
+ *                 format: password
+ *                 description: User's password (min 6 characters).
+ *               name:
+ *                 type: string
+ *                 description: User's full name.
+ *               recaptchaToken:
+ *                 type: string
+ *                 description: Google reCAPTCHA v3 token for verification.
+ *     responses:
+ *       201:
+ *         description: User registered successfully.
+ *       400:
+ *         description: Bad request (e.g., reCAPTCHA failed, invalid input).
+ *       409:
+ *         description: Conflict (e.g., email already exists).
+ *       500:
+ *         description: Internal server error.
+ */
+router.post('/register', async (req, res) => {
+  const { email, password, name, phoneNumber, recaptchaToken } = req.body;
+  const defaultRole = 'user';
+
+  let userRecord; // To hold the created Firebase Auth user for rollback purposes
+  try {
+    // 0. Verify reCAPTCHA token before proceeding
+    userRecord = await admin.auth().createUser({
+      email,
+      password,
+      displayName: name,
+      phoneNumber,
+      disabled: true, // User is disabled by default, requires admin approval.
+    });
+
+    // Verify reCAPTCHA token after creating user but before DB insert
+    if (!await verifyRecaptcha(recaptchaToken)) {
+      throw new Error('reCAPTCHA verification failed.');
+    }
+    
+    // 2. Set custom role claim for authorization
+    await admin.auth().setCustomUserClaims(userRecord.uid, { role: defaultRole });
+
+    // 3. Insert user record into PostgreSQL with 'inactive' status
+    const pool = await poolPromise;
+    const pgClient = await pool.connect(req.schema);
+    try {
+      await pgClient.query(
+        'INSERT INTO users (user_id, email, name, phone, role, status) VALUES ($1, $2, $3, $4, $5, $6)',
+        [userRecord.uid, userRecord.email, name, phoneNumber, defaultRole, 'inactive']
+      );
+    } finally {
+      pgClient.release(); // Always release the client back to the pool
+    }
+
+    logger.info(
+      `New user registered (pending approval): ${email} (UID: ${userRecord.uid}) with role '${defaultRole}'. ` +
+      `Account is currently disabled.`
+    );
+    res.status(201).json({
+      message: 'User registered successfully. Your account is pending admin approval.',
+      userId: userRecord.uid,
+      role: defaultRole,
+    });
+  } catch (error) {
+    logger.error('Error during registration:', error);
+
+    // Attempt to roll back previous steps if any part of the process failed
+    if (userRecord && userRecord.uid) {
+      // If the PostgreSQL insert fails, roll back the Firebase Auth user creation.
+      try {
+        await admin.auth().deleteUser(userRecord.uid);
+        logger.warn(`Rolled back Firebase Auth user (UID: ${userRecord.uid}) due to a subsequent step failing.`);
+      } catch (deleteError) {
+        logger.error(`CRITICAL: Failed to roll back Firebase Auth user (UID: ${userRecord.uid}). Manual cleanup required.`, deleteError);
+      }
+    }
+
+    // Handle specific Firebase Auth errors
+    if (error.code === 'auth/email-already-exists') {
+      return res.status(409).json({ error: 'The email address is already in use by another account.' });
+    }
+    if (error.message === 'reCAPTCHA verification failed.') {
+      return res.status(400).json({ error: 'reCAPTCHA verification failed. Please try again.' });
+    }
+    if (error.code === 'auth/invalid-phone-number') {
+      return res.status(400).json({ error: 'The phone number is not valid. Please use E.164 format (e.g., +15551234567).' });
+    }
+    // Generic error for other Firebase Auth or Firestore issues
+    res.status(500).json({ error: 'An internal error occurred during registration.', details: error.message });
+  }
+});
+
+/**
+ * @swagger
+ * /api/auth/user-by-phone:
+ *   post:
+ *     summary: Get user's email by their phone number
+ *     tags: [Authentication]
+ *     description: Used during the login process to allow users to sign in with their phone number instead of email. This is a public endpoint.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - phoneNumber
+ *             properties:
+ *               phoneNumber:
+ *                 type: string
+ *                 description: The user's phone number in E.164 format.
+ *     responses:
+ *       200:
+ *         description: The user's email was found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 email:
+ *                   type: string
+ *                   format: email
+ *       404:
+ *         description: No user found with the provided phone number.
+ *       500:
+ *         description: Internal server error.
+ */
+router.post('/user-by-phone', async (req, res) => {
+  const { phoneNumber } = req.body;
+
+  if (!phoneNumber) {
+    return res.status(400).json({ error: 'Phone number is required.' });
+  }
+
+  // This endpoint is public for the login flow, so no token verification is needed.
+  // It simply acts as a lookup service.
+  const pool = await poolPromise;
+  const pgClient = await pool.connect(req.schema);
+  try {
+    // Query the database for a user with the given phone number
+    const userRes = await pgClient.query(
+      'SELECT email FROM users WHERE phone = $1',
+      [phoneNumber]
+    );
+
+    if (userRes.rows.length === 0) {
+      // No user found with that phone number
+      logger.warn(`Phone-to-email lookup failed: No user found for phone number ${phoneNumber}`);
+      return res.status(404).json({ error: 'No user found with that phone number.' });
+    }
+
+    // User found, return their email
+    const user = userRes.rows[0];
+    logger.info(`Phone-to-email lookup successful for phone number ${phoneNumber}`);
+    res.status(200).json({ email: user.email });
+  } catch (error) {
+    logger.error(`Error during phone-to-email lookup for ${phoneNumber}:`, error);
+    res.status(500).json({ error: 'Internal server error.' });
+  } finally {
+    pgClient.release(); // Make sure to release the client back to the pool
+  }
+});
+
+/**
+ * POST /api/auth/verify-phone
+ * Consumes an ID token from a successful client-side phone OTP verification.
+ * Verifies the token and marks the user's phone as verified in the database.
+ */
+router.post('/verify-phone', async (req, res) => {
+  const { idToken } = req.body;
+
+  if (!idToken) {
+    return res.status(401).json({ error: 'ID token not provided.' });
+  }
+
+  try {
+    // 1. Verify the ID token. This proves the user completed the OTP flow.
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    const { uid, phone_number } = decodedToken;
+
+    if (!phone_number) {
+      return res.status(400).json({ error: 'Token is not from a phone number authentication.' });
+    }
+
+    // 2. Update the user's status in PostgreSQL
+    const pool = await poolPromise;
+    const pgClient = await pool.connect(req.schema);
+    try {
+      await pgClient.query("UPDATE users SET phone_verified = true, updated_at = NOW() WHERE user_id = $1", [uid]);
+      logger.info(`Phone number ${phone_number} verified for user UID: ${uid}`);
+    } finally {
+      pgClient.release();
+    }
+
+    res.status(200).json({ status: 'success', message: 'Phone number verified successfully.' });
+  } catch (error) {
+    logger.error('Error verifying phone auth token:', error);
+    res.status(401).json({ error: 'Unauthorized. Invalid or expired token.' });
+  }
+});
+
+/**
+ * POST /api/auth/google/sync
+ * Syncs a Firebase Google sign-in user into PostgreSQL as inactive.
+ */
+router.post('/google/sync', verifyFirebaseToken, async (req, res) => {
+  const { uid, email, name, picture } = req.user;
+  const requestedUid = normalizeString(req.body.uid);
+
+  if (requestedUid && requestedUid !== uid) {
+    return res.status(403).json({ error: 'The supplied uid does not match the authenticated user.' });
+  }
+
+  try {
+    const userRecord = await admin.auth().getUser(uid);
+
+    if (!isGoogleSignIn(req.user, userRecord)) {
+      return res.status(400).json({ error: 'This endpoint is only for Google sign-in users.' });
+    }
+
+    const resolvedEmail = userRecord.email || email;
+    if (!resolvedEmail) {
+      return res.status(400).json({ error: 'Google account email is required to sync this user.' });
+    }
+
+    const resolvedName = userRecord.displayName || name || resolvedEmail.split('@')[0];
+    const resolvedPhotoUrl = userRecord.photoURL || picture || null;
+    const defaultRole = 'user';
+
+    await admin.auth().setCustomUserClaims(uid, {
+      ...(userRecord.customClaims || {}),
+      role: userRecord.customClaims && userRecord.customClaims.role ? userRecord.customClaims.role : defaultRole,
+    });
+
+    const pool = await poolPromise;
+    const pgClient = await pool.connect(req.schema);
+    try {
+      const userRes = await pgClient.query(
+        `INSERT INTO users (user_id, email, name, phone, role, status, profile_image_url, phone_verified)
+         VALUES ($1, $2, $3, NULL, $4, 'inactive', $5, false)
+         ON CONFLICT (user_id) DO UPDATE SET
+           email = EXCLUDED.email,
+           name = COALESCE(NULLIF(users.name, ''), EXCLUDED.name),
+           profile_image_url = COALESCE(users.profile_image_url, EXCLUDED.profile_image_url),
+           role = COALESCE(users.role, EXCLUDED.role),
+           updated_at = NOW()
+         RETURNING user_id as "id", email, name, phone as "phoneNumber", role, status,
+           phone_verified as "phoneVerified", profile_image_url as "profileImageUrl"`,
+        [uid, resolvedEmail, resolvedName, defaultRole, resolvedPhotoUrl]
+      );
+
+      // Keep Firebase Auth disabled state aligned with DB approval status.
+      const shouldDisable = userRes.rows[0].status !== 'active';
+      await admin.auth().updateUser(uid, { disabled: shouldDisable });
+
+      logger.info(`Google sign-in user synced to database: ${resolvedEmail} (UID: ${uid}).`);
+      return res.status(200).json({
+        message: 'Google user synced successfully.',
+        user: userRes.rows[0],
+      });
+    } finally {
+      pgClient.release();
+    }
+  } catch (error) {
+    logger.error(`Error syncing Google user ${uid}:`, error);
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'A user with this email or phone already exists.' });
+    }
+    return res.status(500).json({ error: 'Failed to sync Google user.', details: error.message });
+  }
+});
+
+/**
+ * POST /api/auth/google/complete-profile
+ * Completes a previously synced Google user's backend profile.
+ */
+router.post('/google/complete-profile', verifyFirebaseToken, async (req, res) => {
+  const { uid } = req.user;
+  const requestedUid = normalizeString(req.body.uid);
+  const phoneNumber = normalizeString(req.body.phoneNumber || req.body.phone);
+  const name = normalizeString(req.body.name);
+
+  if (!requestedUid) {
+    return res.status(400).json({ error: 'uid is required.' });
+  }
+  if (requestedUid !== uid) {
+    return res.status(403).json({ error: 'The supplied uid does not match the authenticated user.' });
+  }
+  if (!phoneNumber) {
+    return res.status(400).json({ error: 'phoneNumber is required.' });
+  }
+
+  try {
+    const userRecord = await admin.auth().getUser(uid);
+
+    if (!isGoogleSignIn(req.user, userRecord)) {
+      return res.status(400).json({ error: 'This endpoint is only for Google sign-in users.' });
+    }
+
+    const pool = await poolPromise;
+    const pgClient = await pool.connect(req.schema);
+    try {
+      await pgClient.query('BEGIN');
+
+      const userRes = await pgClient.query(
+        `UPDATE users
+         SET phone = $1,
+             name = COALESCE(NULLIF($2, ''), name),
+             status = 'inactive',
+             phone_verified = CASE WHEN phone != $1 THEN false ELSE phone_verified END,
+             updated_at = NOW()
+         WHERE user_id = $3
+         RETURNING user_id as "id", email, name, phone as "phoneNumber", role, status,
+           phone_verified as "phoneVerified", profile_image_url as "profileImageUrl"`,
+        [phoneNumber, name, uid]
+      );
+
+      if (userRes.rows.length === 0) {
+        await pgClient.query('ROLLBACK');
+        return res.status(404).json({ error: 'Google user has not been synced yet.' });
+      }
+
+      // Keep Google users pending admin approval after profile completion.
+      const firebaseUpdates = { disabled: true };
+      if (name) firebaseUpdates.displayName = name;
+      if (!userRecord.phoneNumber || userRecord.phoneNumber !== phoneNumber) {
+        firebaseUpdates.phoneNumber = phoneNumber;
+      }
+
+      if (Object.keys(firebaseUpdates).length > 0) {
+        await admin.auth().updateUser(uid, firebaseUpdates);
+      }
+
+      await pgClient.query('COMMIT');
+
+      logger.info(`Google user profile completed for UID: ${uid}.`);
+      return res.status(200).json({
+        message: 'Profile completed successfully.',
+        user: userRes.rows[0],
+      });
+    } catch (transactionError) {
+      try {
+        await pgClient.query('ROLLBACK');
+      } catch (rollbackError) {
+        logger.error(`Rollback failed while completing Google profile for ${uid}:`, rollbackError);
+      }
+      throw transactionError;
+    } finally {
+      pgClient.release();
+    }
+  } catch (error) {
+    logger.error(`Error completing Google profile for ${uid}:`, error);
+    if (error.code === 'auth/invalid-phone-number') {
+      return res.status(400).json({ error: 'The phone number is not valid. Please use E.164 format (e.g., +15551234567).' });
+    }
+    if (error.code === 'auth/phone-number-already-exists' || error.code === '23505') {
+      return res.status(409).json({ error: 'That phone number is already in use.' });
+    }
+    return res.status(500).json({ error: 'Failed to complete profile.', details: error.message });
+  }
+});
+
+// --- 2. Get Current User Profile Endpoint ---
+/**
+ * GET /api/auth/profile
+ * This endpoint is protected by the verifyFirebaseToken middleware. If the token
+ * is valid, it fetches the user's full profile from the database and returns it.
+ * @swagger
+ * /api/auth/profile:
+ *   get:
+ *     summary: Get the current user's profile
+ *     tags: [Authentication]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: The user's profile data.
+ *       401:
+ *         description: Unauthorized, token is missing or invalid.
+ *       404:
+ *         description: User profile not found in the database.
+ *       500:
+ *         description: Internal server error.
+ */
+router.get('/profile', verifyFirebaseToken, async (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.removeHeader('ETag');
+
+  const { uid } = req.user;
+
+  const pool = await poolPromise;
+  const pgClient = await pool.connect(req.schema);
+  try {
+    // Fetch the user's full profile from PostgreSQL
+    let userRes = await pgClient.query(
+      'SELECT user_id as "id", email, name, phone as "phoneNumber", role, status, phone_verified as "phoneVerified", balance FROM users WHERE user_id = $1',
+      [uid]
+    );
+
+    // Fallback: user not found in current schema — try the dev schema.
+    // This handles the case where a fresh JWT hasn't picked up the 'developer' claim yet
+    // (Firebase custom claims can take minutes to propagate to new tokens).
+    if (userRes.rows.length === 0) {
+      logger.warn(`User ${uid} not found in schema '${req.schema}'; trying dev schema fallback.`);
+      const fallbackClient = await pool.connect('dev');
+      try {
+        const fallbackRes = await fallbackClient.query(
+          'SELECT user_id as "id", email, name, phone as "phoneNumber", role, status, phone_verified as "phoneVerified", balance FROM users WHERE user_id = $1',
+          [uid]
+        );
+        if (fallbackRes.rows.length > 0) {
+          logger.info(`User ${uid} found in dev schema (role: ${fallbackRes.rows[0].role}). Using dev profile.`);
+          const userProfile = fallbackRes.rows[0];
+
+          // Also check for active battery session
+          const batteryQuery = `
+            SELECT bat.battery_uid as "batteryUid", s.charge_level_percent as "chargeLevel",
+                   bo.booth_uid AS "boothUid", s.slot_identifier AS "slotIdentifier"
+            FROM deposits d
+            JOIN booth_slots s ON d.slot_id = s.id
+            JOIN booths bo ON d.booth_id = bo.id
+            LEFT JOIN batteries bat ON s.current_battery_id = bat.id
+            WHERE d.user_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed'
+              AND s.current_battery_id IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM deposits w
+                WHERE w.consumed_deposit_id = d.id
+                  AND w.session_type = 'withdrawal'
+                  AND w.status NOT IN ('cancelled', 'failed')
+              )`;
+          const batteryRes = await fallbackClient.query(batteryQuery, [uid]);
+          if (batteryRes.rows.length > 0) {
+            userProfile.activeBatterySession = batteryRes.rows[0];
+          }
+
+          return res.status(200).json(userProfile);
+        }
+      } finally {
+        fallbackClient.release();
+      }
+      logger.error(`Session valid for UID ${uid}, but user not found in PostgreSQL (schemas tried: ${req.schema}, dev).`);
+      return res.status(404).json({ error: 'User profile not found.' });
+    }
+
+    const userProfile = userRes.rows[0];
+
+    // --- Check for an active battery session (consistent with login) ---
+    const batteryQuery = `
+      -- Find the user's "deposit credit" - a completed deposit session
+      -- that has not yet been redeemed by a withdrawal.
+      SELECT
+        bat.battery_uid as "batteryUid",
+        s.charge_level_percent as "chargeLevel",
+        bo.booth_uid AS "boothUid",
+        s.slot_identifier AS "slotIdentifier"
+      FROM deposits d
+      JOIN booth_slots s ON d.slot_id = s.id
+      JOIN booths bo ON d.booth_id = bo.id
+      LEFT JOIN batteries bat ON s.current_battery_id = bat.id
+      WHERE d.user_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed'
+        AND s.current_battery_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM deposits w
+          WHERE w.consumed_deposit_id = d.id
+            AND w.session_type = 'withdrawal'
+            AND w.status NOT IN ('cancelled', 'failed')
+        );
+    `;
+    const batteryRes = await pgClient.query(batteryQuery, [uid]);
+
+    if (batteryRes.rows.length > 0) {
+      userProfile.activeBatterySession = batteryRes.rows[0];
+    }
+
+    // Return the user profile
+    res.status(200).json(userProfile);
+  } catch (error) {
+    logger.error(`Error fetching session for user ${uid}:`, error);
+    res.status(500).json({ error: 'Failed to retrieve user session.' });
+  } finally {
+    pgClient.release();
+  }
+});
+
+/**
+ * POST /api/auth/fcm-token
+ * Save or clear the current user's FCM token for push notifications.
+ */
+router.post('/fcm-token', verifyFirebaseToken, async (req, res) => {
+  const { uid } = req.user;
+
+  // Prevent conditional-GET caching on this per-user, always-dynamic endpoint
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.set('Pragma', 'no-cache');
+  const { token } = req.body;
+
+  if (token !== null && token !== undefined && typeof token !== 'string') {
+    return res.status(400).json({ error: 'token must be a string or null.' });
+  }
+
+  const normalizedToken = typeof token === 'string' ? token.trim() : null;
+  const valueToSave = normalizedToken ? normalizedToken : null;
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      'UPDATE users SET fcm_token = $1, updated_at = NOW() WHERE user_id = $2 RETURNING user_id',
+      [valueToSave, uid]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'User profile not found.' });
+    }
+
+    logger.info(`FCM token ${valueToSave ? 'saved' : 'cleared'} for user ${uid}.`);
+    return res.status(200).json({
+      message: valueToSave ? 'FCM token saved.' : 'FCM token cleared.',
+    });
+  } catch (error) {
+    logger.error(`Failed to update FCM token for user ${uid}:`, error);
+    return res.status(500).json({
+      error: 'Failed to update FCM token.',
+      details: error.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * POST /api/auth/profile/picture
+ * Updates the current user's profile picture.
+ * Expects a multipart/form-data request with a single file field named 'profileImage'.
+ */
+router.post(
+  '/profile/picture',
+  [
+    verifyFirebaseToken,
+    uploadToGcsMiddleware('profileImage', 'profile-pictures'),
+  ],
+  async (req, res) => {
+    const { uid } = req.user;
+
+    if (!req.file || !req.file.gcsUrl) {
+      return res.status(400).json({ error: 'No image file was uploaded.' });
+    }
+
+    const imageUrl = req.file.gcsUrl;
+    const pool = await poolPromise;
+    const client = await pool.connect();
+    try {
+      // Update the user's record in PostgreSQL with the new image URL
+      await client.query('UPDATE users SET profile_image_url = $1 WHERE user_id = $2', [imageUrl, uid]);
+
+      // Optionally, update the user's photoURL in Firebase Auth as well
+      await admin.auth().updateUser(uid, { photoURL: imageUrl });
+
+      logger.info(`User ${uid} updated their profile picture. New URL: ${imageUrl}`);
+      res.status(200).json({ message: 'Profile picture updated successfully.', imageUrl });
+    } catch (error) {
+      logger.error(`Failed to update profile picture for user ${uid}:`, error);
+      res.status(500).json({ error: 'Failed to update profile picture.', details: error.message });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+module.exports = router;

@@ -1,0 +1,668 @@
+const { getDatabase } = require('firebase-admin/database');
+const pool = require('../db');
+const logger = require('./logger');
+const { finalizeWithdrawalSession } = require('./sessionUtils');
+const { reconcileSlotDeposit } = require('./depositReconcile');
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Checks if an error is a PostgreSQL pool connection timeout.
+ * @param {any} error - The error object to check.
+ * @returns {boolean} True if it is a connection timeout error.
+ */
+function isPoolConnectTimeoutError(error) {
+  return String(error?.message || '').includes('timeout exceeded when trying to connect');
+}
+
+/**
+ * Acquires a PostgreSQL client from the pool with retry logic for timeouts.
+ * @param {object} dbPool - The PostgreSQL pool instance.
+ * @param {string} boothUid - The booth UID for logging.
+ * @param {string} slotIdentifier - The slot identifier for logging.
+ * @param {number} [maxAttempts] - Maximum number of connection attempts.
+ * @returns {Promise<object>} A connected PostgreSQL client.
+ */
+async function acquirePgClientWithRetry(dbPool, boothUid, slotIdentifier, maxAttempts = 3) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await dbPool.connect();
+    } catch (error) {
+      const isTimeout = isPoolConnectTimeoutError(error);
+      if (!isTimeout || attempt === maxAttempts) {
+        throw error;
+      }
+
+      const backoffMs = attempt * 250;
+      logger.warn(
+        `Pool connect timeout for ${boothUid}/${slotIdentifier} (attempt ${attempt}/${maxAttempts}). Retrying in ${backoffMs}ms.`
+      );
+      await sleep(backoffMs);
+    }
+  }
+
+  throw new Error('Failed to acquire database client after retries.');
+}
+
+/**
+ * Checks if any property in the slot data has changed.
+ * @param {object|null} slotBefore - Previous slot state.
+ * @param {object} slotAfter - Current slot state.
+ * @returns {boolean} True if data has changed.
+ */
+function hasSlotChanged(slotBefore, slotAfter) {
+  if (!slotBefore) return true;
+  try {
+    return JSON.stringify(slotBefore) !== JSON.stringify(slotAfter);
+  } catch {
+    // If serialization fails for any reason, fail safe and process the update.
+    return true;
+  }
+}
+
+// Serialize sync work per booth to avoid pool storms during bursty hardware updates.
+const boothSyncQueues = new Map();
+
+/**
+ * Enqueues a sync task for a specific booth to ensure sequential processing.
+ * @param {string} boothUid - The unique identifier for the booth.
+ * @param {Function} task - An async function representing the sync work.
+ * @returns {void}
+ */
+function enqueueBoothSync(boothUid, task) {
+  const previousTask = boothSyncQueues.get(boothUid) || Promise.resolve();
+  const nextTask = previousTask
+    .catch(() => {})
+    .then(task)
+    .catch((error) => {
+      logger.error(`[FirebaseSync] Booth queue task failed for ${boothUid}:`, error);
+    })
+    .finally(() => {
+      if (boothSyncQueues.get(boothUid) === nextTask) {
+        boothSyncQueues.delete(boothUid);
+      }
+    });
+
+  boothSyncQueues.set(boothUid, nextTask);
+}
+
+/**
+ * Maps the status from Firebase to the corresponding status in the PostgreSQL enum.
+ * @param {string} firebaseStatus - The overall status from the Firebase slot data (e.g., 'booting', 'available').
+ * @param {string} currentDbStatus - The current status of the slot in the database.
+ * @param {boolean} batteryInserted - From telemetry, indicates if a battery is physically present.
+ * @returns {string} The corresponding PostgreSQL status.
+ */
+function mapSlotStatus(firebaseStatus, currentDbStatus, batteryInserted) {
+  // This mapping can be expanded as more states are defined in the IoT device firmware.
+  if (firebaseStatus === 'fault') return 'faulty';
+  if (firebaseStatus === 'maintenance') return 'maintenance';
+  if (currentDbStatus === 'disabled') return 'disabled';
+
+  // Protect the 'opening' state: If the DB says we are waiting for a deposit,
+  // do not revert to 'available' just because the battery isn't in yet.
+  if (currentDbStatus === 'opening' && !batteryInserted) {
+    return 'opening';
+  }
+
+  // If a battery is physically present, the slot should be considered 'occupied'
+  // unless it's in a transient 'opening' state for a deposit.
+  if (batteryInserted) {
+    return currentDbStatus === 'opening' ? 'opening' : 'occupied';
+  }
+
+  // If no battery is present, it's available.
+  return 'available';
+}
+
+/**
+ * Maps the door status from Firebase to the PostgreSQL enum.
+ * @param {boolean} doorClosed - From Firebase slot data.
+ * @param {boolean} doorLocked - From Firebase slot data.
+ * @returns {string} 'locked', 'closed', or 'open'.
+ */
+function mapDoorStatus(doorClosed, doorLocked) {
+  if (doorLocked) return 'locked';
+  if (doorClosed) return 'closed';
+  return 'open';
+}
+
+/**
+ * Normalizes a raw SOC value to an integer between 1 and 100.
+ * @param {any} rawSoc - The raw SOC value from telemetry.
+ * @returns {number|null} The normalized SOC or null if invalid.
+ */
+function normalizeSoc(rawSoc) {
+  const parsed = Number(rawSoc);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 100) {
+    return null;
+  }
+  return parsed;
+}
+
+/**
+ * Extracts the SOC value from a telemetry object.
+ * @param {object} telemetry - The telemetry data object.
+ * @returns {number|null} The SOC or null if not found.
+ */
+function getChargeSocFromTelemetry(telemetry) {
+  const soc = normalizeSoc(telemetry?.soc);
+  if (soc !== null) {
+    return soc;
+  }
+
+  return null;
+}
+
+/**
+ * A robust function to find and complete a deposit session.
+ * This can be triggered by telemetry changes or an explicit ACK from the hardware.
+ * @param {object} pgClient - The active PostgreSQL client.
+ * @param {string} boothUid - The UID of the booth.
+ * @param {string} slotIdentifier - The identifier of the slot.
+ * @param {number} slotId - The primary key of the slot in the database.
+ * @param {object} telemetry - The latest telemetry data for the slot.
+ * @returns {Promise<boolean>} True if a session was completed.
+ */
+async function handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotId, telemetry) {
+  const chargeLevel = getChargeSocFromTelemetry(telemetry);
+  const findAndUpdateDepositQuery = `
+    UPDATE deposits
+    SET
+      status = 'completed',
+      initial_charge_level = $1,
+      completed_at = NOW()
+    WHERE
+      slot_id = $2
+      AND status IN ('opening', 'occupied') -- The session must have been in an 'opening' or 'occupied' state.
+      AND session_type = 'deposit'
+    RETURNING id;
+  `;
+  const depositUpdateResult = await pgClient.query(findAndUpdateDepositQuery, [chargeLevel, slotId]);
+
+  if (depositUpdateResult.rowCount > 0) {
+    const depositId = depositUpdateResult.rows[0].id;
+    logger.info(`Deposit session ${depositId} for slot ${slotIdentifier} completed with initial charge ${chargeLevel}%.`);
+
+    // Ensure the slot has a linked battery record. Dev booths and admin simulations
+    // already set current_battery_id, but the normal hardware flow does not.
+    // Without this, my-battery-status returns empty because it requires
+    // s.current_battery_id IS NOT NULL.
+    try {
+      const slotCheck = await pgClient.query(
+        'SELECT current_battery_id FROM booth_slots WHERE id = $1',
+        [slotId]
+      );
+      if (slotCheck.rows.length > 0 && slotCheck.rows[0].current_battery_id === null) {
+        const batteryUid = `bat-${slotId}-${Date.now()}`;
+        const batteryRes = await pgClient.query(
+          `INSERT INTO batteries (battery_uid, charge_level_percent, health_status)
+           VALUES ($1, $2, 'good')
+           ON CONFLICT (battery_uid) DO UPDATE SET charge_level_percent = $2
+           RETURNING id`,
+          [batteryUid, chargeLevel]
+        );
+        const batteryId = batteryRes.rows[0].id;
+        await pgClient.query(
+          'UPDATE booth_slots SET current_battery_id = $1 WHERE id = $2',
+          [batteryId, slotId]
+        );
+        await pgClient.query(
+          'UPDATE deposits SET battery_id = $1 WHERE id = $2',
+          [batteryId, depositId]
+        );
+        logger.info(`Linked new battery ${batteryUid} (id=${batteryId}) to slot ${slotIdentifier} for deposit ${depositId}.`);
+      }
+    } catch (batteryError) {
+      logger.error(`Failed to create/link battery for slot ${slotIdentifier}:`, batteryError);
+    }
+
+    // Automatically send command to start charging the newly deposited battery.
+    const db = getDatabase();
+    const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
+    await commandRef.update({
+      startCharging: true,
+      stopCharging: false // Ensure mutual exclusivity
+    });
+    logger.info(`Sent 'startCharging' command to ${slotIdentifier} at booth ${boothUid} after deposit completion.`);
+    return true; // Indicate that a session was completed.
+  }
+  return false; // No session was completed.
+}
+
+/**
+ * A robust function to find and complete a withdrawal session.
+ * This can be triggered by telemetry changes or an explicit ACK from the hardware.
+ * @param {object} pgClient - The active PostgreSQL client.
+ * @param {string} slotIdentifier - The identifier of the slot.
+ * @param {number} slotId - The primary key of the slot in the database.
+ * @returns {Promise<boolean>} True if a session was completed.
+ */
+async function handleWithdrawalCompletion(pgClient, slotIdentifier, slotId) {
+  const finalized = await finalizeWithdrawalSession(pgClient, slotId, slotIdentifier);
+  return finalized !== null;
+}
+
+/**
+ * Syncs a single slot's state from Firebase to PostgreSQL.
+ * @param {string} boothUid - The unique identifier for the booth.
+ * @param {string} slotIdentifier - The identifier for the slot (e.g., 'slot001').
+ * @param {object} slotData - The latest slot data from Firebase.
+ * @param {object|null} slotBefore - The previous state of the slot (for change detection).
+ * @returns {Promise<void>}
+ */
+async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
+  if (!slotData) return;
+
+  // Use the refined change detection logic.
+  if (!hasSlotChanged(slotBefore, slotData)) {
+    return;
+  }
+
+  const dbPool = await pool;
+  const pgClient = await acquirePgClientWithRetry(dbPool, boothUid, slotIdentifier);
+
+  try {
+    const telemetry = slotData.telemetry || {};
+    const batteryInserted = !!telemetry.batteryInserted;
+    const soc = getChargeSocFromTelemetry(telemetry);
+
+    // 1. Fetch current database state for this slot.
+    const currentSlotRes = await pgClient.query(
+      `SELECT bs.id, bs.status, b.id as booth_id 
+       FROM booth_slots bs
+       JOIN booths b ON bs.booth_id = b.id
+       WHERE b.booth_uid = $1 AND bs.slot_identifier = $2`,
+      [boothUid, slotIdentifier]
+    );
+
+    let slotId;
+    let boothId;
+    let dbStatus;
+
+    if (currentSlotRes.rowCount === 0) {
+      // 2. If the slot doesn't exist, create it (Auto-provisioning).
+      logger.info(`Slot ${slotIdentifier} not found for booth ${boothUid}. Auto-provisioning...`);
+      const boothLookup = await pgClient.query("SELECT id FROM booths WHERE booth_uid = $1", [boothUid]);
+      if (boothLookup.rowCount === 0) {
+        throw new Error(`Booth ${boothUid} not found.`);
+      }
+      boothId = boothLookup.rows[0].id;
+      const insertRes = await pgClient.query(
+        `INSERT INTO booth_slots (booth_id, slot_identifier, status, door_status) 
+         VALUES ($1, $2, 'available', 'closed') RETURNING id`,
+        [boothId, slotIdentifier]
+      );
+      slotId = insertRes.rows[0].id;
+      dbStatus = 'available';
+    } else {
+      slotId = currentSlotRes.rows[0].id;
+      dbStatus = currentSlotRes.rows[0].status;
+    }
+
+    // 3. Map Firebase data to PostgreSQL enums.
+    const newStatus = mapSlotStatus(slotData.status, dbStatus, batteryInserted);
+    const doorStatus = mapDoorStatus(!!telemetry.doorClosed, !!telemetry.doorLocked);
+    const isCharging = !!telemetry.isCharging;
+
+    // 4. Update the database.
+    // When the battery is physically removed, also clear current_battery_id to prevent
+    // stale deposit credits from being usable against a slot that will be reassigned.
+    const batteryCleared = !batteryInserted && dbStatus !== 'available';
+    const result = await pgClient.query(
+      `UPDATE booth_slots 
+       SET 
+         status = $1, 
+         door_status = $2, 
+         charge_level_percent = $3, 
+         is_charging = $4,
+         telemetry = $5,
+         current_battery_id = CASE WHEN $7 THEN NULL ELSE current_battery_id END,
+         updated_at = NOW()
+       WHERE id = $6`,
+      [newStatus, doorStatus, soc, isCharging, telemetry, slotId, batteryCleared]
+    );
+
+    if (result.rowCount === 0) {
+      // This can happen if the booth_uid doesn't exist in the `booths` table yet.
+      logger.warn(`Could not sync slot ${slotIdentifier}. Booth with UID ${boothUid} not found in the database.`);
+      return; // Exit if we can't find the slot
+    }
+
+    if (!slotId) {
+      slotId = result.rows[0].id; // Get the newly created slot ID.
+    }
+    logger.debug(`Successfully synced slot ${slotIdentifier} for booth ${boothUid}.`);
+
+    // 5. Defensive cleanup: If the slot just transitioned to 'available' from a non-available
+    // state (battery physically removed), fail any orphaned unredeemed completed deposits.
+    // This is the critical safety net that prevents double-allocation: without this, a stale
+    // deposit credit from a previous user would remain 'completed' when the slot is reassigned.
+    if (newStatus === 'available' && dbStatus !== 'available' && dbStatus !== 'opening') {
+      const orphanResult = await pgClient.query(
+        `UPDATE deposits
+         SET status = 'failed',
+             notes = COALESCE(notes, '') || '\n[' || NOW() || '] Deposit failed: battery removed from slot, slot returned to available.'
+         WHERE slot_id = $1
+           AND session_type = 'deposit'
+           AND status = 'completed'
+           AND NOT EXISTS (
+             SELECT 1 FROM deposits w
+             WHERE w.consumed_deposit_id = deposits.id
+               AND w.session_type = 'withdrawal'
+               AND w.status NOT IN ('cancelled', 'failed')
+           )`,
+        [slotId]
+      );
+      if (orphanResult.rowCount > 0) {
+        logger.warn(`Cleaned up ${orphanResult.rowCount} orphaned deposit(s) for slot ${slotIdentifier} (${dbStatus} -> available).`);
+      }
+    }
+
+    // 5b. Self-healing reconcile: if the battery is physically present and the slot
+    // is occupied, re-complete any deposit that was wrongly marked 'failed' (e.g. by
+    // a transient telemetry flicker that briefly reported the battery as absent).
+    if (batteryInserted && newStatus === 'occupied') {
+      try {
+        await reconcileSlotDeposit(pgClient, slotId, slotIdentifier);
+      } catch (reconcileError) {
+        logger.error(`Failed to reconcile deposit for slot ${slotIdentifier}:`, reconcileError);
+      }
+    }
+
+    // --- Event-driven logic based on hardware ACK messages ---
+    const ackMessage = slotData.command?.ack;
+
+    if (ackMessage) {
+      const db = getDatabase();
+      const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
+
+      // Use a switch to handle different ACK messages from the hardware.
+      switch (ackMessage) {
+        case 'openForCollection_pulsed': {
+          // The hardware has successfully energized the solenoid.
+          logger.info(`Received 'openForCollection_pulsed' for slot ${slotIdentifier}. Recording attempt.`);
+          try {
+            // Update the session notes so the user/admin can see that an attempt occurred.
+            await pgClient.query(
+              `UPDATE deposits 
+               SET notes = COALESCE(notes, '') || '\n[' || NOW() || '] Hardware pulsed solenoid for collection.'
+               WHERE slot_id = $1 AND status = 'in_progress' AND session_type = 'withdrawal'`,
+              [slotId]
+            );
+            // IMPORTANT: Clear the command and ACK. By setting openForCollection back to false,
+            // we allow the app to re-issue the command, which the hardware will see as a fresh trigger.
+            await commandRef.update({ openForCollection: false, ack: "" });
+          } catch (dbError) {
+            logger.error(`Failed to log hardware pulse for ${slotIdentifier}:`, dbError);
+          }
+          break;
+        }
+
+        case 'collection_complete': {
+          // This is the definitive signal that a user has taken their battery.
+          logger.info(`Received 'collection_complete' ACK for slot ${slotIdentifier}. Finalizing withdrawal session.`);
+          try {
+            // Use the centralized handler
+            if (!await handleWithdrawalCompletion(pgClient, slotIdentifier, slotId)) {
+              logger.warn(`'collection_complete' ACK for ${slotIdentifier} received, but no 'in_progress' session was found to complete.`);
+            }
+            // Clear command and ACK to stop hardware reporting
+            await commandRef.update({ openForCollection: false, ack: "" });
+          } catch (dbError) {
+            logger.error(`Failed to finalize withdrawal session in DB for slot ${slotIdentifier} after 'collection_complete' ACK:`, dbError);
+          }
+          break;
+        }
+
+        case 'deposit_accepted': {
+          // This is the definitive signal that a user has successfully deposited a battery.
+          logger.info(`Received 'deposit_accepted' ACK for slot ${slotIdentifier}. Finalizing deposit session.`);
+          try {
+            if (!await handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotId, telemetry)) {
+              logger.warn(`'deposit_accepted' ACK for ${slotIdentifier} received, but no 'opening' session was found to complete.`);
+            }
+            // Clear command and ACK
+            await commandRef.update({ openForDeposit: false, ack: "" });
+          } catch (dbError) {
+            logger.error(`Failed to finalize deposit session in DB for slot ${slotIdentifier} after 'deposit_accepted' ACK:`, dbError);
+          }
+          break;
+        }
+
+        case 'collection_timeout': {
+          logger.warn(`Received 'collection_timeout' ACK for slot ${slotIdentifier}. Failing the in-progress withdrawal session.`);
+          // The user paid but did not collect the battery in time. The battery is likely still
+          // in the slot, so we only mark the withdrawal as failed and let the user retry.
+          // If the battery was actually removed, the next Firebase telemetry sync will
+          // detect it and clean up via syncSlotState().
+          const timeoutFailResult = await pgClient.query(
+            "UPDATE deposits SET status = 'failed' WHERE slot_id = $1 AND status = 'in_progress' AND session_type = 'withdrawal' RETURNING id",
+            [slotId]
+          );
+          if (timeoutFailResult.rowCount > 0) {
+            logger.info(`Session ${timeoutFailResult.rows[0].id} marked as 'failed' due to collection timeout.`);
+          }
+          await commandRef.update({ openForCollection: false, ack: "" });
+          break;
+        }
+
+        case 'openForCollection_rejected_no_battery': {
+          logger.warn(`Received 'openForCollection_rejected_no_battery' ACK for slot ${slotIdentifier}. Battery is physically gone — cleaning up slot and orphaned deposits.`);
+          // The hardware confirmed no battery is present. The battery was removed during the
+          // failed collection attempt. We must reset the slot AND fail any orphaned deposit
+          // to prevent double-allocation when a new user is assigned to this slot.
+          const noBatteryFailResult = await pgClient.query(
+            "UPDATE deposits SET status = 'failed' WHERE slot_id = $1 AND status = 'in_progress' AND session_type = 'withdrawal' RETURNING id",
+            [slotId]
+          );
+          if (noBatteryFailResult.rowCount > 0) {
+            logger.info(`Session ${noBatteryFailResult.rows[0].id} marked as 'failed' due to no battery in slot.`);
+          }
+
+          // Reset the slot: the battery is gone, so the slot is available again.
+          await pgClient.query(
+            `UPDATE booth_slots SET status = 'available', current_battery_id = NULL, updated_at = NOW() WHERE id = $1`,
+            [slotId]
+          );
+
+          // Fail any orphaned completed deposit on this slot that hasn't been redeemed by a
+          // successful withdrawal. This prevents double-allocation: without this, the old
+          // deposit credit would remain 'completed' and a new user could be assigned to the
+          // same slot, resulting in two users claiming the same slot.
+          await pgClient.query(
+            `UPDATE deposits
+             SET status = 'failed',
+                 notes = COALESCE(notes, '') || '\n[' || NOW() || '] Deposit failed: battery physically removed during unsuccessful withdrawal.'
+             WHERE slot_id = $1
+               AND session_type = 'deposit'
+               AND status = 'completed'
+               AND NOT EXISTS (
+                 SELECT 1 FROM deposits w
+                 WHERE w.consumed_deposit_id = deposits.id
+                   AND w.session_type = 'withdrawal'
+                   AND w.status NOT IN ('cancelled', 'failed')
+               )`,
+            [slotId]
+          );
+
+          await commandRef.update({ openForCollection: false, ack: "" });
+          break;
+        }
+
+        case 'deposit_timeout':
+        case 'openForDeposit_rejected_battery_present':
+        case 'rejected_no_plug': // Deposit failed: plug not connected
+        case 'rejected_voltage': // Deposit failed: bad voltage
+        case 'rejected_temperature': // Deposit failed: bad temp
+        case 'rejected_door_open': { // Deposit failed: door not closed
+          logger.warn(`Received deposit failure ACK '${ackMessage}' for slot ${slotIdentifier}. Cancelling pending deposit session.`);
+          // The deposit failed. Cancel the session and free up the slot.
+          const cancelQueryResult = await pgClient.query(
+            "UPDATE deposits SET status = 'cancelled' WHERE slot_id = $1 AND status = 'opening' AND session_type = 'deposit' RETURNING id",
+            [slotId]
+          );
+          if (cancelQueryResult.rowCount > 0) {
+            logger.info(`Session ${cancelQueryResult.rows[0].id} marked as 'cancelled' due to deposit failure.`);
+          }
+          // Explicitly ensure the slot is marked available if the deposit failed
+          await pgClient.query("UPDATE booth_slots SET status = 'available' WHERE id = $1", [slotId]);
+          // Reset command state
+          await commandRef.update({ openForDeposit: false, ack: "" });
+          break;
+        }
+
+        case 'charging_resumed': {
+          logger.info(`Received 'charging_resumed' for slot ${slotIdentifier}. Updating DB: is_charging = true.`);
+          await pgClient.query("UPDATE booth_slots SET is_charging = true WHERE id = $1", [slotId]);
+          await commandRef.update({ ack: "" });
+          break;
+        }
+
+        case 'startCharging_accepted': {
+          logger.info(`Received 'startCharging_accepted' for slot ${slotIdentifier}. Updating DB: is_charging = true.`);
+          await pgClient.query("UPDATE booth_slots SET is_charging = true WHERE id = $1", [slotId]);
+          await commandRef.update({ startCharging: false, ack: "" });
+          break;
+        }
+
+        case 'stopCharging_done': {
+          logger.info(`Received 'stopCharging_done' for slot ${slotIdentifier}. Updating DB: is_charging = false.`);
+          await pgClient.query("UPDATE booth_slots SET is_charging = false WHERE id = $1", [slotId]);
+          await commandRef.update({ stopCharging: false, ack: "" });
+          break;
+        }
+
+        case 'resume_blocked_safety':
+        case 'startCharging_rejected_safety': {
+          logger.error(`CRITICAL: Received '${ackMessage}' for slot ${slotIdentifier}. Updating DB to reflect charging is OFF.`);
+          // The hardware refused to charge. This is important to reflect in our database.
+          await pgClient.query("UPDATE booth_slots SET is_charging = false WHERE id = $1", [slotId]);
+
+          // Update any active session on this slot with a note about the safety block.
+          await pgClient.query(
+            `UPDATE deposits 
+             SET notes = COALESCE(notes, '') || '\n[' || NOW() || '] Hardware Safety Block: ' || $1
+             WHERE slot_id = $2 AND status NOT IN ('completed', 'failed', 'cancelled', 'redeemed')`,
+            [ackMessage, slotId]
+          );
+
+          await commandRef.update({ startCharging: false, ack: "" });
+          break;
+        }
+
+        case 'battery_full': {
+          logger.info(`Received 'battery_full' ACK for slot ${slotIdentifier}. Updating DB: is_charging = false.`);
+          // The battery is full, so we should stop charging it.
+          await pgClient.query("UPDATE booth_slots SET is_charging = false WHERE id = $1", [slotId]);
+          await commandRef.update({ ack: "" });
+          break;
+        }
+
+        // Log informational ACKs for debugging and visibility.
+        case 'openForCollection_sent':
+        case 'openForDeposit_sent':
+        case 'startCharging_pulsed':
+        case 'forceLock_done':
+          logger.debug(`Hardware signal: ${ackMessage} for slot ${slotIdentifier}.`);
+          break;
+
+        case 'forceUnlock_pulsed':
+        case 'forceUnlock_done': {
+          logger.debug(`Hardware signal: ${ackMessage} for slot ${slotIdentifier}. Clearing command and resetting slot if empty.`);
+          try {
+            if (!batteryInserted) {
+              await pgClient.query(
+                `UPDATE booth_slots SET status = 'available', current_battery_id = NULL, updated_at = NOW() WHERE id = $1`,
+                [slotId]
+              );
+              // Fail orphaned completed deposits so they don't appear as active sessions
+              await pgClient.query(
+                `UPDATE deposits
+                 SET status = 'failed',
+                     notes = COALESCE(notes, '') || '\n[' || NOW() || '] Slot freed via force-unlock.'
+                 WHERE slot_id = $1
+                   AND session_type = 'deposit' AND status = 'completed'`,
+                [slotId]
+              );
+              logger.info(`Force unlock acknowledged for empty slot ${slotIdentifier}. Slot reset to available.`);
+            }
+            await commandRef.update({ forceUnlock: false, ack: "" });
+          } catch (dbError) {
+            logger.error(`Failed to process force unlock cleanup for ${slotIdentifier}:`, dbError);
+          }
+          break;
+        }
+
+        default:
+          logger.debug(`Received unhandled ACK '${ackMessage}' for slot ${slotIdentifier}. No action taken.`);
+          break;
+      }
+    }
+    // --- End of ACK-based logic ---
+
+  } catch (error) {
+    logger.error(`Error syncing slot ${boothUid}/${slotIdentifier}:`, error);
+  } finally {
+    pgClient.release();
+  }
+}
+
+// In-memory cache to hold the last known state of each booth.
+const boothStateCache = {};
+
+/**
+ * Initializes the Firebase listener for the 'booths' path.
+ * @returns {void}
+ */
+function initializeFirebaseSync() {
+  const db = getDatabase();
+  const boothsRef = db.ref('booths');
+
+  logger.info('Initializing Firebase Realtime Database sync for /booths...');
+
+  // 1. Initial data load to populate the cache.
+  boothsRef.once('value', (snapshot) => {
+    Object.assign(boothStateCache, snapshot.val());
+    logger.info('Firebase listener cache populated with initial booth states.');
+  });
+
+  // Listen for changes to any child under the 'booths' path.
+  boothsRef.on('child_changed', (boothSnapshot) => {
+    const boothUid = boothSnapshot.key;
+    const boothAfter = boothSnapshot.val();
+
+    enqueueBoothSync(boothUid, async () => {
+      const boothBefore = boothStateCache[boothUid] || {};
+      const beforeSlots = boothBefore.slots || {};
+      const afterSlots = boothAfter?.slots || {};
+
+      // Identify which slots have changed and need syncing.
+      const slotIdentifiers = new Set([
+        ...Object.keys(beforeSlots),
+        ...Object.keys(afterSlots),
+      ]);
+
+      const syncPromises = [];
+      for (const slotIdentifier of slotIdentifiers) {
+        const slotBefore = beforeSlots[slotIdentifier];
+        const slotAfter = afterSlots[slotIdentifier];
+
+        // Process only if the slot exists in the latest snapshot.
+        if (slotAfter) {
+          syncPromises.push(syncSlotState(boothUid, slotIdentifier, slotAfter, slotBefore));
+        }
+      }
+
+      await Promise.all(syncPromises);
+      // Update the cache with the latest state for this booth.
+      boothStateCache[boothUid] = boothAfter;
+    });
+  });
+}
+
+module.exports = { 
+  initializeFirebaseSync, 
+  handleWithdrawalCompletion, 
+  handleDepositCompletion 
+};
